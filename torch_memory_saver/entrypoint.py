@@ -1,5 +1,6 @@
 import atexit
 import ctypes
+import json
 
 import numpy as np
 import logging
@@ -134,6 +135,33 @@ class TorchMemorySaver:
     def get_cpu_backup(self, x: torch.Tensor, zero_copy: bool = False):
         self._ensure_initialized()
         return self._impl.get_cpu_backup(x, zero_copy=zero_copy)
+
+    def configure_direct_disk_backup(self, path: str, *, numa_node: int) -> None:
+        """Validate direct reads/writes and pin one staging slot on numa_node.
+
+        Call before creating disk-backed allocations. Placement is immutable;
+        repeating the same configuration is allowed. Linux CUDA is required.
+        """
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise ValueError("path must be a nonempty string without NUL")
+        if isinstance(numa_node, bool) or not isinstance(numa_node, int) or not 0 <= numa_node < 1048576:
+            raise ValueError("numa_node must be a nonnegative Linux NUMA node id")
+        self._ensure_initialized()
+        cdll = self._impl._binary_wrapper.cdll
+        if not hasattr(cdll, "tms_configure_direct_disk_backup"):
+            raise RuntimeError("loaded native TMS lacks direct disk backup support")
+        os.makedirs(path, exist_ok=True)
+        error = cdll.tms_configure_direct_disk_backup(os.fsencode(path), numa_node)
+        if error is not None:
+            raise RuntimeError(os.fsdecode(error))
+
+    def get_disk_backup_info(self) -> dict:
+        """Return native capability, placement, fd flags, and cumulative I/O bytes."""
+        self._ensure_initialized()
+        cdll = self._impl._binary_wrapper.cdll
+        if not hasattr(cdll, "tms_get_disk_backup_info"):
+            raise RuntimeError("loaded native TMS lacks direct disk backup support")
+        return json.loads(cdll.tms_get_disk_backup_info())
 
     def set_disk_backup_dir(self, path: str):
         """Set the directory for disk backup files (created if needed)."""

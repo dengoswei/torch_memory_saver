@@ -155,9 +155,25 @@ void tms_set_enable_disk_backup(bool enable_disk_backup) {
     thread_local_config.set_enable_disk_backup(enable_disk_backup);
 }
 
+// NULL means success; returned strings remain valid until the next call on this thread.
+const char* tms_configure_direct_disk_backup(const char* dir, int numa_node) {
+    static thread_local std::string error;
+    try {
+        if (!dir) throw std::invalid_argument("disk directory is null");
+        TorchMemorySaver::instance().configure_direct_disk_backup(dir, numa_node);
+        return nullptr;
+    } catch (const std::exception& e) { error = e.what(); return error.c_str(); }
+}
+const char* tms_get_disk_backup_info() {
+    static thread_local std::string info;
+    info = TorchMemorySaver::instance().get_disk_backup_info();
+    return info.c_str();
+}
+
 void tms_set_disk_backup_dir(const char* dir) {
     SIMPLE_CHECK(dir != nullptr, "disk backup dir should not be null");
-    TorchMemorySaver::instance().set_disk_backup_dir(std::string(dir));
+    try { TorchMemorySaver::instance().set_disk_backup_dir(std::string(dir)); }
+    catch (const std::exception& e) { SIMPLE_CHECK(false, e.what()); }
 }
 
 void set_memory_margin_bytes(uint64_t value) {

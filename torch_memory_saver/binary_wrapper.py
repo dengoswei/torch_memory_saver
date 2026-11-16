@@ -45,6 +45,11 @@ def _setup_function_signatures(cdll):
     cdll.tms_set_enable_disk_backup.argtypes = [ctypes.c_bool]
     cdll.tms_get_enable_disk_backup.restype = ctypes.c_bool
     cdll.tms_set_disk_backup_dir.argtypes = [ctypes.c_char_p]
+    if hasattr(cdll, "tms_configure_direct_disk_backup"):
+        cdll.tms_configure_direct_disk_backup.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        cdll.tms_configure_direct_disk_backup.restype = ctypes.c_char_p
+        cdll.tms_get_disk_backup_info.argtypes = []
+        cdll.tms_get_disk_backup_info.restype = ctypes.c_char_p
     cdll.tms_pause.argtypes = [ctypes.c_char_p]
     cdll.tms_pause.restype = ctypes.c_int
     cdll.tms_resume.argtypes = [ctypes.c_char_p]

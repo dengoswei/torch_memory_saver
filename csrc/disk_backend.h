@@ -5,30 +5,47 @@
 
 struct DiskBackupSlot {
     std::string path;
+    size_t logical_bytes = 0;
+    size_t padded_bytes = 0;
 };
 
-// Spills paused GPU allocations to per-allocation files, streaming through one
-// shared pinned staging buffer. dir_ must be a real disk mount, not tmpfs.
+// Synchronous disk transfers share one bounded, NUMA-bound pinned buffer.
+// All methods are serialized by the allocator metadata mutex.
 class DiskBackend {
 public:
     DiskBackend(std::string dir, size_t chunk_bytes);
-
-    void set_dir(const std::string& dir) { dir_ = dir; }
-
+    ~DiskBackend();
+    void set_dir(const std::string& dir);
+    void configure(const std::string& dir, int numa_node);
+    void require_configured();
+    std::string info() const;
     void offload(void* gpu_ptr, size_t size, DiskBackupSlot& slot);
     void onload(void* gpu_ptr, size_t size, DiskBackupSlot& slot);
     void release(DiskBackupSlot& slot);
 
 private:
     void ensure_staging_buf_();
-    void warn_once_if_not_real_disk_();
-    int create_slot_file_(DiskBackupSlot& slot, size_t size);
+    void verify_numa_() const;
+    int create_slot_file_(DiskBackupSlot& slot);
     int open_slot_file_(const DiskBackupSlot& slot);
+    void check_fd_(int fd);
+    void stream_(int fd, void* gpu_ptr, size_t size, bool to_disk);
 
     std::string dir_;
     size_t chunk_bytes_;
     void* staging_buf_ = nullptr;
-    bool checked_fs_ = false;
+    void* mapping_base_ = nullptr;
+    size_t mapping_bytes_ = 0;
+    size_t page_bytes_ = 0;
+    size_t mem_alignment_ = 0;
+    size_t io_alignment_ = 0;
+    int numa_node_ = -1;
+    int last_fd_flags_ = 0;
+    int last_fd_descriptor_flags_ = 0;
+    bool configured_ = false;
+    bool allocation_started_ = false;
+    uint64_t logical_write_bytes_ = 0, padded_write_bytes_ = 0;
+    uint64_t logical_read_bytes_ = 0, padded_read_bytes_ = 0;
 };
 
 std::string compute_disk_backup_dir_from_env();

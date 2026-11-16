@@ -7,7 +7,7 @@
 #include <set>
 
 TorchMemorySaver::TorchMemorySaver()
-    : disk_backend_(compute_disk_backup_dir_from_env(), compute_disk_chunk_bytes_from_env()) {
+    : disk_backend_(compute_disk_backup_dir_from_env(), 0) {
 #ifdef USE_CUDA
     retain_cpu_backup_.store(get_bool_env_var("TMS_RETAIN_CPU_BACKUP"));
 #endif
@@ -26,6 +26,10 @@ cudaError_t TorchMemorySaver::malloc(
     const bool enable_cpu_backup,
     const CpuBackupKind cpu_backup_kind,
     const bool enable_disk_backup) {
+    if (enable_disk_backup) {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        disk_backend_.require_configured();
+    }
     // Enforce here, not only in the Python layer: an assert is stripped under
     // python -O and bypassed by direct C-API / env-var use.
     SIMPLE_CHECK(!(enable_cpu_backup && enable_disk_backup),
