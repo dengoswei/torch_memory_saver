@@ -26,7 +26,7 @@ extern "C" ssize_t __wrap_pread(int fd, void* p, size_t n, off_t o) {
     if (read_fault == 2) { read_fault = 0; n = short_alignment; }
     return __real_pread(fd, p, n, o);
 }
-int main(int argc, char** argv) {
+int main(int, char** argv) {
     char name[4096];
     snprintf(name, sizeof(name), "%s/native_XXXXXX", argv[1]);
     File file(mkostemp(name, O_DIRECT | O_CLOEXEC));
@@ -180,3 +180,63 @@ int main() {
                     str(source), "-o", str(binary)], check=True, capture_output=True, text=True)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_readonly_direct_disk_slot_reuse(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "readonly_slot.cpp"
+    source.write_text(r'''
+#include "csrc/disk_backend.cpp"
+#include <cassert>
+int main(int, char** argv) {
+    DiskBackend backend(argv[1], 65536);
+    DiskBackupSlot ro_slot, rw_slot;
+    int ro_fd = backend.create_slot_file_(ro_slot, true);
+    int rw_fd = backend.create_slot_file_(rw_slot, false);
+    assert(ro_slot.path.find("/tms_ro_") != std::string::npos);
+    assert(rw_slot.path.find("/tms_") != std::string::npos);
+    assert(rw_slot.path.find("/tms_ro_") == std::string::npos);
+
+    struct statx sx = {};
+    system_check(statx(ro_fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0, "statx");
+    if (!(sx.stx_mask & STATX_DIOALIGN)) {
+        sx.stx_dio_mem_align = sx.stx_dio_offset_align = 4096;
+    }
+    size_t align = std::lcm(sx.stx_dio_mem_align, sx.stx_dio_offset_align);
+    void* buf = nullptr;
+    assert(posix_memalign(&buf, std::max(align, sizeof(void*)), align) == 0);
+    memset(buf, 0x5c, align);
+    assert(ftruncate(ro_fd, align) == 0);
+    direct_io(ro_fd, buf, align, 0, sx.stx_dio_offset_align, sx.stx_dio_mem_align, true);
+    assert(close(ro_fd) == 0);
+    assert(close(rw_fd) == 0);
+
+    backend.record_readonly_skip(align);
+    std::string info = backend.info();
+    assert(info.find("\"readonly_skipped_write_bytes\":" + std::to_string(align)) != std::string::npos);
+    assert(info.find("\"readonly_skipped_pauses\":1") != std::string::npos);
+
+    DiskBackupSlot reopen_ro{ro_slot.path, align, align};
+    int fd2 = backend.open_slot_file_(reopen_ro);
+    memset(buf, 0, align);
+    direct_io(fd2, buf, align, 0, sx.stx_dio_offset_align, sx.stx_dio_mem_align, false);
+    for (size_t i = 0; i < align; ++i) assert(static_cast<unsigned char*>(buf)[i] == 0x5c);
+    assert(close(fd2) == 0);
+
+    std::string ro_path = ro_slot.path;
+    backend.release(ro_slot);
+    backend.release(rw_slot);
+    assert(access(ro_path.c_str(), F_OK) != 0);
+    free(buf);
+    return 0;
+}
+''')
+    binary = tmp_path / "readonly_slot"
+    subprocess.run(
+        ["g++", "-std=c++17", "-fno-access-control", "-Wall", "-Wextra", "-Werror", "-DUSE_XPU",
+         "-I", str(root), str(source), "-o", str(binary)],
+        check=True, capture_output=True, text=True,
+    )
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMS_TEST_DISK_DIR")) as disk_dir:
+        result = subprocess.run([str(binary), disk_dir], capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr

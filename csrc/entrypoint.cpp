@@ -52,12 +52,24 @@ public:
         enable_disk_backup_ = value;
     }
 
+    bool readonly_disk_backup() {
+        if (!readonly_disk_backup_.has_value()) {
+            readonly_disk_backup_ = get_bool_env_var("TMS_INIT_READONLY_DISK_BACKUP");
+        }
+        return readonly_disk_backup_.value();
+    }
+
+    void set_readonly_disk_backup(bool value) {
+        readonly_disk_backup_ = value;
+    }
+
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
     CpuBackupKind cpu_backup_kind_ = cpu_backup_kind_from_str(
         std::getenv("TMS_INIT_CPU_BACKUP_BACKEND"));
     std::optional<bool> enable_disk_backup_;
+    std::optional<bool> readonly_disk_backup_;
 };
 static thread_local ThreadLocalConfig thread_local_config;
 
@@ -69,7 +81,7 @@ cudaError_t cudaMalloc(void **ptr, size_t size) {
         return TorchMemorySaver::instance().malloc(
             ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_,
             thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-            thread_local_config.enable_disk_backup());
+            thread_local_config.enable_disk_backup(), thread_local_config.readonly_disk_backup());
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -93,7 +105,7 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
         &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
         thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-        thread_local_config.enable_disk_backup()));
+        thread_local_config.enable_disk_backup(), thread_local_config.readonly_disk_backup()));
     return ptr;
 }
 
@@ -153,6 +165,14 @@ bool tms_get_enable_disk_backup() {
 
 void tms_set_enable_disk_backup(bool enable_disk_backup) {
     thread_local_config.set_enable_disk_backup(enable_disk_backup);
+}
+
+bool tms_get_readonly_disk_backup() {
+    return thread_local_config.readonly_disk_backup();
+}
+
+void tms_set_readonly_disk_backup(bool readonly_disk_backup) {
+    thread_local_config.set_readonly_disk_backup(readonly_disk_backup);
 }
 
 // NULL means success; returned strings remain valid until the next call on this thread.

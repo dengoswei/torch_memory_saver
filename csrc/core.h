@@ -49,6 +49,8 @@ struct AllocationMetadata {
     size_t allocation_size;
     CUmemGenericAllocationHandle allocHandle;
 #endif
+    // Write-once direct disk backup for frozen read-only allocations (default false keeps mutable slots unchanged).
+    bool readonly_disk_backup = false;
 };
 
 class TorchMemorySaver {
@@ -62,7 +64,8 @@ public:
         const std::string& tag,
         bool enable_cpu_backup,
         CpuBackupKind cpu_backup_kind,
-        bool enable_disk_backup);
+        bool enable_disk_backup,
+        bool readonly_disk_backup = false);
     cudaError_t free(void *ptr);
 
     cudaError_t pause(const std::string& tag);

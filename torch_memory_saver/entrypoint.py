@@ -32,11 +32,14 @@ class TorchMemorySaver:
         enable_cpu_backup: bool = False,
         enable_disk_backup: bool = False,
         cpu_backup_backend: Optional[CpuBackupBackend] = None,
+        readonly_disk_backup: bool = False,
     ):
         """Context manager for memory saving with optional tag.
 
         enable_disk_backup spills paused memory to files instead of a CPU
-        buffer; mutually exclusive with enable_cpu_backup. The target directory is
+        buffer; mutually exclusive with enable_cpu_backup. Setting
+        readonly_disk_backup=True makes disk spill write-once (first pause writes;
+        later pauses unmap GPU pages with zero disk writes). The target directory is
         process-global (TMS_DISK_BACKUP_DIR or set_disk_backup_dir()), not
         region-scoped, and must be a real disk mount (not tmpfs).
 
@@ -46,6 +49,8 @@ class TorchMemorySaver:
         take cpu_backup_backend.
         """
         self._validate_cpu_backup_backend(enable_cpu_backup, cpu_backup_backend)
+        if readonly_disk_backup and not enable_disk_backup:
+            raise ValueError("readonly_disk_backup requires enable_disk_backup=True")
         self._ensure_initialized()
         assert not (enable_cpu_backup and enable_disk_backup), \
             "enable_cpu_backup and enable_disk_backup are mutually exclusive"
@@ -54,6 +59,7 @@ class TorchMemorySaver:
             enable_cpu_backup=enable_cpu_backup,
             enable_disk_backup=enable_disk_backup,
             cpu_backup_backend=cpu_backup_backend,
+            readonly_disk_backup=readonly_disk_backup,
         ):
             yield
 
@@ -230,6 +236,7 @@ class _TorchMemorySaverImpl:
         enable_cpu_backup: bool,
         enable_disk_backup: bool,
         cpu_backup_backend: Optional[CpuBackupBackend],
+        readonly_disk_backup: bool = False,
     ):
         if self._is_xpu and enable_disk_backup:
             raise NotImplementedError(
@@ -251,6 +258,7 @@ class _TorchMemorySaverImpl:
             tag,
             enable_cpu_backup,
             enable_disk_backup,
+            bool(readonly_disk_backup),
             resolved_cpu_backup_backend,
             device,
         )
@@ -261,6 +269,7 @@ class _TorchMemorySaverImpl:
                 enable_cpu_backup=enable_cpu_backup,
                 enable_disk_backup=enable_disk_backup,
                 cpu_backup_backend=cpu_backup_backend,
+                readonly_disk_backup=readonly_disk_backup,
             ):
                 yield
 
@@ -294,6 +303,7 @@ class _TorchMemorySaverImpl:
         enable_cpu_backup: bool,
         cpu_backup_backend: Optional[CpuBackupBackend],
         enable_disk_backup: bool = False,
+        readonly_disk_backup: bool = False,
     ):
         cdll = self._binary_wrapper.cdll
         orig_tag = cdll.tms_get_current_tag().decode("utf-8")
@@ -301,6 +311,9 @@ class _TorchMemorySaverImpl:
         orig_enable_cpu_backup = cdll.tms_get_enable_cpu_backup()
         orig_cpu_backup_backend = cdll.tms_get_cpu_backup_backend().decode("utf-8")
         orig_enable_disk_backup = cdll.tms_get_enable_disk_backup()
+        orig_readonly_disk_backup = (
+            cdll.tms_get_readonly_disk_backup() if hasattr(cdll, "tms_get_readonly_disk_backup") else False
+        )
         expected_cpu_backup_backend = cpu_backup_backend or orig_cpu_backup_backend
 
         self._binary_wrapper.set_config(
@@ -309,6 +322,7 @@ class _TorchMemorySaverImpl:
             enable_cpu_backup=enable_cpu_backup,
             cpu_backup_backend=cpu_backup_backend,
             enable_disk_backup=enable_disk_backup,
+            readonly_disk_backup=readonly_disk_backup,
         )
         try:
             yield
@@ -320,6 +334,8 @@ class _TorchMemorySaverImpl:
                 == expected_cpu_backup_backend
             )
             assert cdll.tms_get_enable_disk_backup() == enable_disk_backup
+            if hasattr(cdll, "tms_get_readonly_disk_backup"):
+                assert cdll.tms_get_readonly_disk_backup() == readonly_disk_backup
             assert cdll.tms_get_current_tag().decode("utf-8") == tag
             self._binary_wrapper.set_config(
                 tag=orig_tag,
@@ -327,6 +343,7 @@ class _TorchMemorySaverImpl:
                 enable_cpu_backup=orig_enable_cpu_backup,
                 cpu_backup_backend=orig_cpu_backup_backend,
                 enable_disk_backup=orig_enable_disk_backup,
+                readonly_disk_backup=orig_readonly_disk_backup,
             )
 
     @contextmanager

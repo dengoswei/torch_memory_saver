@@ -152,8 +152,8 @@ void DiskBackend::check_fd_(int fd) {
     last_fd_flags_ = flags;
     last_fd_descriptor_flags_ = descriptor_flags;
 }
-int DiskBackend::create_slot_file_(DiskBackupSlot& slot) {
-    std::string name = dir_ + "/tms_XXXXXX";
+int DiskBackend::create_slot_file_(DiskBackupSlot& slot, bool readonly_slot) {
+    std::string name = dir_ + (readonly_slot ? "/tms_ro_XXXXXX" : "/tms_XXXXXX");
     std::vector<char> chars(name.begin(), name.end());
     chars.push_back('\0');
     int fd = mkostemp(chars.data(), O_DIRECT | O_CLOEXEC);
@@ -280,10 +280,10 @@ void DiskBackend::stream_(int fd, void* gpu_ptr, size_t size, bool to_disk) {
         offset += n;
     }
 }
-void DiskBackend::offload(void* gpu_ptr, size_t size, DiskBackupSlot& slot) {
+void DiskBackend::offload(void* gpu_ptr, size_t size, DiskBackupSlot& slot, bool readonly_slot) {
     try {
         require(configured_, "direct disk backend is not configured");
-        File file(slot.path.empty() ? create_slot_file_(slot) : open_slot_file_(slot));
+        File file(slot.path.empty() ? create_slot_file_(slot, readonly_slot) : open_slot_file_(slot));
         slot.logical_bytes = size;
         slot.padded_bytes = round_up(size, io_alignment_);
         require(slot.padded_bytes <= static_cast<size_t>(std::numeric_limits<off_t>::max()), "file size overflow");
@@ -322,6 +322,8 @@ std::string DiskBackend::info() const {
         << ",\"alignment_source\":\"STATX_DIOALIGN\""
         << ",\"fd_flags\":" << last_fd_flags_ << ",\"fd_descriptor_flags\":" << last_fd_descriptor_flags_
         << ",\"logical_write_bytes\":" << logical_write_bytes_ << ",\"padded_write_bytes\":" << padded_write_bytes_
-        << ",\"logical_read_bytes\":" << logical_read_bytes_ << ",\"padded_read_bytes\":" << padded_read_bytes_ << "}";
+        << ",\"logical_read_bytes\":" << logical_read_bytes_ << ",\"padded_read_bytes\":" << padded_read_bytes_
+        << ",\"readonly_skipped_write_bytes\":" << readonly_skipped_write_bytes_
+        << ",\"readonly_skipped_pauses\":" << readonly_skipped_pauses_ << "}";
     return out.str();
 }

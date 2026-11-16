@@ -19,14 +19,18 @@ public:
     void configure(const std::string& dir, int numa_node);
     void require_configured();
     std::string info() const;
-    void offload(void* gpu_ptr, size_t size, DiskBackupSlot& slot);
+    void offload(void* gpu_ptr, size_t size, DiskBackupSlot& slot, bool readonly_slot = false);
     void onload(void* gpu_ptr, size_t size, DiskBackupSlot& slot);
     void release(DiskBackupSlot& slot);
+    void record_readonly_skip(size_t logical_bytes) {
+        readonly_skipped_write_bytes_ += logical_bytes;
+        ++readonly_skipped_pauses_;
+    }
 
 private:
     void ensure_staging_buf_();
     void verify_numa_() const;
-    int create_slot_file_(DiskBackupSlot& slot);
+    int create_slot_file_(DiskBackupSlot& slot, bool readonly_slot = false);
     int open_slot_file_(const DiskBackupSlot& slot);
     void check_fd_(int fd);
     void stream_(int fd, void* gpu_ptr, size_t size, bool to_disk);
@@ -46,6 +50,7 @@ private:
     bool allocation_started_ = false;
     uint64_t logical_write_bytes_ = 0, padded_write_bytes_ = 0;
     uint64_t logical_read_bytes_ = 0, padded_read_bytes_ = 0;
+    uint64_t readonly_skipped_write_bytes_ = 0, readonly_skipped_pauses_ = 0;
 };
 
 std::string compute_disk_backup_dir_from_env();

@@ -23,6 +23,7 @@ class BinaryWrapper:
         enable_cpu_backup: bool,
         cpu_backup_backend: Optional[str] = None,
         enable_disk_backup: bool = False,
+        readonly_disk_backup: bool = False,
     ):
         self.cdll.tms_set_current_tag(tag.encode("utf-8"))
         self.cdll.tms_set_interesting_region(interesting_region)
@@ -30,6 +31,8 @@ class BinaryWrapper:
         if cpu_backup_backend is not None:
             self.cdll.tms_set_cpu_backup_backend(cpu_backup_backend.encode("utf-8"))
         self.cdll.tms_set_enable_disk_backup(enable_disk_backup)
+        if hasattr(self.cdll, "tms_set_readonly_disk_backup"):
+            self.cdll.tms_set_readonly_disk_backup(readonly_disk_backup)
 
 
 def _setup_function_signatures(cdll):
@@ -44,6 +47,9 @@ def _setup_function_signatures(cdll):
     cdll.tms_get_cpu_backup_backend.restype = ctypes.c_char_p
     cdll.tms_set_enable_disk_backup.argtypes = [ctypes.c_bool]
     cdll.tms_get_enable_disk_backup.restype = ctypes.c_bool
+    if hasattr(cdll, "tms_set_readonly_disk_backup"):
+        cdll.tms_set_readonly_disk_backup.argtypes = [ctypes.c_bool]
+        cdll.tms_get_readonly_disk_backup.restype = ctypes.c_bool
     cdll.tms_set_disk_backup_dir.argtypes = [ctypes.c_char_p]
     if hasattr(cdll, "tms_configure_direct_disk_backup"):
         cdll.tms_configure_direct_disk_backup.argtypes = [ctypes.c_char_p, ctypes.c_int]

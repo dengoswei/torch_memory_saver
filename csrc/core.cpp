@@ -25,7 +25,10 @@ cudaError_t TorchMemorySaver::malloc(
     const std::string& tag,
     const bool enable_cpu_backup,
     const CpuBackupKind cpu_backup_kind,
-    const bool enable_disk_backup) {
+    const bool enable_disk_backup,
+    const bool readonly_disk_backup) {
+    SIMPLE_CHECK(!readonly_disk_backup || enable_disk_backup,
+                 "readonly_disk_backup requires enable_disk_backup");
     if (enable_disk_backup) {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
         disk_backend_.require_configured();
@@ -84,7 +87,8 @@ cudaError_t TorchMemorySaver::malloc(
             AllocationMetadata{
                 raw_size, device, tag, AllocationState::ACTIVE,
                 enable_cpu_backup, CpuBackupSlot{cpu_backup_kind, nullptr, 0},
-                enable_disk_backup, DiskBackupSlot{}, allocation_size, allocHandle}
+                enable_disk_backup, DiskBackupSlot{}, allocation_size, allocHandle,
+                readonly_disk_backup}
         );
     }
 
@@ -209,7 +213,13 @@ cudaError_t TorchMemorySaver::pause(const std::string& tag) {
         if (metadata.enable_cpu_backup) {
             cpu_backuper::offload(ptr, metadata.raw_size, metadata.cpu_backup);
         } else if (metadata.enable_disk_backup) {
-            disk_backend_.offload(ptr, metadata.raw_size, metadata.disk);
+            if (metadata.readonly_disk_backup && !metadata.disk.path.empty()) {
+                SIMPLE_CHECK(metadata.disk.logical_bytes == metadata.raw_size,
+                             "readonly disk slot logical_bytes mismatch on skip");
+                disk_backend_.record_readonly_skip(metadata.raw_size);
+            } else {
+                disk_backend_.offload(ptr, metadata.raw_size, metadata.disk, metadata.readonly_disk_backup);
+            }
         }
 
         CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.allocation_size));
