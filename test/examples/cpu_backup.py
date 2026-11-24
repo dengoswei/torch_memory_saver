@@ -8,6 +8,11 @@ from ctypes.util import find_library
 import torch
 
 from torch_memory_saver import torch_memory_saver
+from torch_memory_saver.entrypoint import (
+    _PoolKey,
+    _StorageMode,
+    _torch_supports_detached_mempool_free,
+)
 from torch_memory_saver.testing_utils import empty_cache, get_device, get_device_module, is_mlu
 
 
@@ -174,6 +179,154 @@ def run(hook_mode: str):
 
                 _assert_cpu_backup_released_on_allocation_free(device=device_id, paused=False)
                 _assert_cpu_backup_released_on_allocation_free(device=device_id, paused=True)
+
+
+def run_write_once(hook_mode: str):
+    torch_memory_saver.hook_mode = hook_mode
+    logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
+    assert torch_memory_saver.retain_cpu_backup is False
+
+    device = get_device()
+    mod = get_device_module()
+    if hook_mode == "torch" and not _torch_supports_detached_mempool_free():
+        try:
+            with torch_memory_saver.region(tag="ro_unsupported", backup="cpu", write_once=True):
+                pass
+        except NotImplementedError:
+            return
+        raise AssertionError("expected NotImplementedError for write_once in torch mode < 2.8")
+
+    tms2 = torch_memory_saver.__class__()
+    tms2.hook_mode = hook_mode
+    with torch_memory_saver.region(tag="ro_open", backup="cpu", write_once=True):
+        _ = torch.empty((1024,), dtype=torch.float32, device=device)
+        for bad_call in (
+            lambda: torch_memory_saver.pause(),
+            lambda: torch_memory_saver.pause("ro_open"),
+            lambda: tms2.pause(),
+        ):
+            try:
+                bad_call()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("pause() succeeded inside an open write_once region")
+        for bad_nested in (
+            lambda: torch_memory_saver.region(tag="rw_nested", backup="cpu"),
+            lambda: tms2.region(tag="rw_nested2", backup="none"),
+            lambda: torch_memory_saver.disable(),
+        ):
+            try:
+                with bad_nested():
+                    pass
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("nested scope succeeded inside an open write_once region")
+    empty_cache()
+
+    backends = ["pinned"] if torch.version.hip else ["pinned", "mmap"]
+    ro_oracles = {}
+    ro_tensors = {}
+    for idx, backend in enumerate(backends):
+        oracle = _make_pattern(size=4096, offset=11 + idx * 26).to(torch.float32)
+        with torch_memory_saver.region(
+            tag=f"ro_{backend}", backup="cpu", cpu_backup_backend=backend, write_once=True
+        ):
+            tensor = oracle.to(device)
+        ro_oracles[backend] = oracle
+        ro_tensors[backend] = tensor
+
+    rw_initial = _make_pattern(size=4096, offset=71).to(torch.float32)
+    rw_updated = _make_pattern(size=4096, offset=93).to(torch.float32)
+    with torch_memory_saver.region(tag="rw", backup="cpu"):
+        rw = rw_initial.to(device)
+
+    torch_memory_saver.pause()
+    ro_ptrs = {
+        b: torch_memory_saver.get_cpu_backup(t, zero_copy=True).data_ptr()
+        for b, t in ro_tensors.items()
+    }
+
+    torch_memory_saver.resume()
+    for b, t in ro_tensors.items():
+        assert torch.equal(t.cpu(), ro_oracles[b])
+        # write_once keeps CPU shadows across non-retaining resume.
+        assert torch_memory_saver.get_cpu_backup(t, zero_copy=True).data_ptr() == ro_ptrs[b]
+    assert torch.equal(rw.cpu(), rw_initial)
+    assert torch_memory_saver.get_cpu_backup(rw) is None
+
+    # Mutate all tensors on GPU: second pause skips D2H for write_once slots.
+    for t in ro_tensors.values():
+        t.fill_(999.0)
+    rw.copy_(rw_updated.to(device))
+
+    torch_memory_saver.pause()
+    torch_memory_saver.resume()
+
+    for b, t in ro_tensors.items():
+        assert torch.equal(t.cpu(), ro_oracles[b])
+        assert torch_memory_saver.get_cpu_backup(t, zero_copy=True).data_ptr() == ro_ptrs[b]
+    assert torch.equal(rw.cpu(), rw_updated)
+
+    # Re-entering the same write_once tag after freeing must allocate a fresh pool/slot.
+    for backend in backends:
+        tag = f"ro_reuse_{backend}"
+        a_oracle = _make_pattern(size=4096, offset=120).to(torch.float32)
+        b_oracle = _make_pattern(size=4096, offset=150).to(torch.float32)
+        with torch_memory_saver.region(
+            tag=tag, backup="cpu", cpu_backup_backend=backend, write_once=True
+        ):
+            tensor_a = a_oracle.to(device)
+        torch_memory_saver.pause(tag=tag)
+        torch_memory_saver.resume(tag=tag)
+        assert torch.equal(tensor_a.cpu(), a_oracle)
+        del tensor_a
+        with torch_memory_saver.region(
+            tag=tag, backup="cpu", cpu_backup_backend=backend, write_once=True
+        ):
+            tensor_b = b_oracle.to(device)
+        torch_memory_saver.pause(tag=tag)
+        torch_memory_saver.resume(tag=tag)
+        assert torch.equal(tensor_b.cpu(), b_oracle)
+        del tensor_b
+
+    # Cross-instance pause() retires pools owned by sibling TorchMemorySaver instances.
+    x_a_oracle = _make_pattern(size=4096, offset=165).to(torch.float32)
+    x_b_oracle = _make_pattern(size=4096, offset=175).to(torch.float32)
+    with tms2.region(tag="ro_xinst", backup="cpu", write_once=True):
+        x_a = x_a_oracle.to(device)
+    torch_memory_saver.pause(tag="ro_xinst")
+    torch_memory_saver.resume(tag="ro_xinst")
+    assert torch.equal(x_a.cpu(), x_a_oracle)
+    del x_a
+    with tms2.region(tag="ro_xinst", backup="cpu", write_once=True):
+        x_b = x_b_oracle.to(device)
+    torch_memory_saver.pause(tag="ro_xinst")
+    torch_memory_saver.resume(tag="ro_xinst")
+    assert torch.equal(x_b.cpu(), x_b_oracle)
+    del x_b
+
+    # Repeated retire + empty_cache() without entering region() reclaims GPU/CPU resources.
+    for cycle in range(3):
+        cycle_tag = f"ro_reclaim_{cycle}"
+        cycle_oracle = _make_pattern(size=4096, offset=190 + cycle).to(torch.float32)
+        with torch_memory_saver.region(tag=cycle_tag, backup="cpu", write_once=True):
+            cycle_tensor = cycle_oracle.to(device)
+        torch_memory_saver.pause(tag=cycle_tag)
+        backup_ptr = torch_memory_saver.get_cpu_backup(cycle_tensor, zero_copy=True).data_ptr()
+        assert _host_pointer_is_allocated(backup_ptr)
+        torch_memory_saver.resume(tag=cycle_tag)
+        assert torch.equal(cycle_tensor.cpu(), cycle_oracle)
+        del cycle_tensor
+        gc.collect()
+        empty_cache()
+        mod.synchronize()
+        assert not _host_pointer_is_allocated(backup_ptr)
+
+    ro_tensors.clear()
+    del rw
+    empty_cache()
 
 
 def run_retain_from_env(hook_mode: str):
@@ -359,8 +512,7 @@ def _assert_cpu_backup_released_on_allocation_free(device: int, paused: bool) ->
         assert torch.equal(backup, expected)
         assert torch.equal(tensor.cpu(), expected)
 
-    # MemPool key includes resolved cpu_backup_backend (default pinned).
-    pool_key = (tag, True, False, "pinned", device)
+    pool_key = _PoolKey(tag=tag, device=device, storage=_StorageMode.CPU_PINNED)
     pool = torch_memory_saver._impl._mem_pools.pop(pool_key)
     get_device_module().synchronize(device)
     del backup

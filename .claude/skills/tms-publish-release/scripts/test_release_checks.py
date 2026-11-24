@@ -4,6 +4,8 @@ import base64
 import csv
 import hashlib
 import importlib.util
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -517,6 +519,343 @@ class TestArtifactValidation:
                 repo_root=tmp_path,
             )
 
+    def test_wheel_binary_importing_post_manylinux2014_glibc_symbol_is_rejected(self, tmp_path: Path) -> None:
+        """Wheel binaries must not import post-manylinux2014 glibc symbols."""
+
+        _write_release_artifacts(dist_dir=tmp_path, version="0.0.10b1")
+        wheel_path = (
+            tmp_path / "torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_x86_64.whl"
+        )
+        for bad_symbol in (
+            "statx",
+            "statx@GLIBC_2.28",
+            "getdents64",
+            "getdents64@GLIBC_2.30",
+            "getrandom",
+            "getrandom@GLIBC_2.25",
+        ):
+            _rewrite_wheel_file(
+                wheel_path=wheel_path,
+                target_name="torch_memory_saver_hook_mode_preload_cu12.abi3.so",
+                content=_elf_header(architecture="x86_64", undefined_symbols=(bad_symbol,)),
+            )
+
+            with pytest.raises(
+                ValueError,
+                match=f"Forbidden post-manylinux2014 symbol/ABI requirement.*{bad_symbol}",
+            ):
+                release_checks.validate_release_artifacts(
+                    dist_dir=tmp_path,
+                    expected_version="0.0.10b1",
+                    repo_root=tmp_path,
+                )
+
+    def test_wheel_binary_verneed_glibc_ceiling_enforced(self, tmp_path: Path) -> None:
+        """manylinux2014 wheel gate enforces PEP 599 GLIBC/GLIBCXX/CXXABI/GCC ceilings."""
+
+        _write_release_artifacts(dist_dir=tmp_path, version="0.0.10b1")
+        wheel_path = (
+            tmp_path / "torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_x86_64.whl"
+        )
+        _rewrite_wheel_file(
+            wheel_path=wheel_path,
+            target_name="torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+            content=_elf_header(
+                architecture="x86_64",
+                undefined_symbols=(
+                    "memcpy",
+                    "clock_gettime",
+                    "__cxa_atexit",
+                    "_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc",
+                    "_Unwind_Resume",
+                    "_ITM_registerTMCloneTable",
+                ),
+                verneed_versions=(
+                    "GLIBC_2.2.5",
+                    "GLIBC_2.17",
+                    "CXXABI_1.3",
+                    "CXXABI_1.3.7",
+                    "CXXABI_TM_1",
+                    "GLIBCXX_3.4",
+                    "GLIBCXX_3.4.19",
+                    "GCC_3.0",
+                    "GCC_4.8.0",
+                ),
+                undefined_ver_indices=(2, 3, 4, 8, 10, 6),
+            ),
+        )
+        release_checks.validate_release_artifacts(
+            dist_dir=tmp_path,
+            expected_version="0.0.10b1",
+            repo_root=tmp_path,
+        )
+
+        for elf_kwargs, pattern in (
+            (
+                {
+                    "undefined_symbols": ("pthread_once", "dlsym", "fstat"),
+                    "verneed_versions": ("GLIBC_2.33", "GLIBC_2.34"),
+                    "undefined_ver_indices": (3, 3, 2),
+                },
+                r"pthread_once@GLIBC_2\.34",
+            ),
+            (
+                {
+                    "undefined_symbols": ("getentropy",),
+                    "verneed_versions": ("GLIBC_2.18",),
+                    "undefined_ver_indices": (2,),
+                },
+                r"getentropy@GLIBC_2\.18",
+            ),
+            (
+                {
+                    "undefined_symbols": ("__private_sym",),
+                    "verneed_versions": ("GLIBC_PRIVATE",),
+                    "undefined_ver_indices": (2,),
+                },
+                r"__private_sym@GLIBC_PRIVATE",
+            ),
+            (
+                {
+                    "verneed_versions": ("GLIBC_2.34",),
+                },
+                r"GLIBC_2\.34",
+            ),
+            (
+                {
+                    "undefined_symbols": ("_ZSt28__throw_bad_array_new_lengthv",),
+                    "verneed_versions": ("GLIBCXX_3.4.29",),
+                    "undefined_ver_indices": (2,),
+                },
+                r"_ZSt28__throw_bad_array_new_lengthv@GLIBCXX_3\.4\.29",
+            ),
+            (
+                {
+                    "verneed_versions": ("GLIBCXX_3.4.20",),
+                },
+                r"GLIBCXX_3\.4\.20",
+            ),
+            (
+                {
+                    "undefined_symbols": ("__cxa_throw_bad_array_new_length",),
+                    "verneed_versions": ("CXXABI_1.3.8",),
+                    "undefined_ver_indices": (2,),
+                },
+                r"__cxa_throw_bad_array_new_length@CXXABI_1\.3\.8",
+            ),
+            (
+                {
+                    "verneed_versions": ("CXXABI_1.3.9",),
+                },
+                r"CXXABI_1\.3\.9",
+            ),
+            (
+                {
+                    "undefined_symbols": ("__cxa_init_primary_exception",),
+                    "verneed_versions": ("CXXABI_FLOAT128",),
+                    "undefined_ver_indices": (2,),
+                },
+                r"__cxa_init_primary_exception@CXXABI_FLOAT128",
+            ),
+            (
+                {
+                    "verneed_versions": ("GCC_4.9.0",),
+                },
+                r"GCC_4\.9\.0",
+            ),
+        ):
+            _rewrite_wheel_file(
+                wheel_path=wheel_path,
+                target_name="torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+                content=_elf_header(architecture="x86_64", **elf_kwargs),
+            )
+            with pytest.raises(
+                ValueError,
+                match=f"Forbidden post-manylinux2014 symbol/ABI requirement.*{pattern}",
+            ):
+                release_checks.validate_release_artifacts(
+                    dist_dir=tmp_path,
+                    expected_version="0.0.10b1",
+                    repo_root=tmp_path,
+                )
+
+        # Unconditional non-circular multi-library ELF regression (runs even without built .so files).
+        multi_lib_dir = tmp_path / "multi_lib_elf"
+        multi_lib_dir.mkdir()
+        _write_release_artifacts(dist_dir=multi_lib_dir, version="0.0.10b1")
+        multi_lib_wheel = (
+            multi_lib_dir
+            / "torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_x86_64.whl"
+        )
+        _rewrite_wheel_file(
+            wheel_path=multi_lib_wheel,
+            target_name="torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+            content=_elf_header(
+                architecture="x86_64",
+                undefined_symbols=(
+                    "clock_gettime",
+                    "fstat",
+                    "pthread_once",
+                    "_Znwm",
+                    "_ZSt28__throw_bad_array_new_lengthv",
+                    "__cxa_thread_atexit",
+                    "_ZdlPvm",
+                    "_ITM_registerTMCloneTable",
+                    "_Unwind_Resume",
+                    "_Unwind_Backtrace",
+                ),
+                verneed_libraries=(
+                    ("libc.so.6", ("GLIBC_2.17", "GLIBC_2.33", "GLIBC_2.34")),
+                    (
+                        "libstdc++.so.6",
+                        (
+                            "GLIBCXX_3.4.19",
+                            "GLIBCXX_3.4.29",
+                            "CXXABI_1.3.7",
+                            "CXXABI_1.3.9",
+                            "CXXABI_TM_1",
+                        ),
+                    ),
+                    ("libgcc_s.so.1", ("GCC_4.8.0", "GCC_4.9.0")),
+                ),
+                undefined_ver_indices=(2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+            ),
+        )
+        expected_multi_msg = (
+            "Forbidden post-manylinux2014 symbol/ABI requirement in "
+            "torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_x86_64.whl:"
+            "torch_memory_saver_hook_mode_preload_cu13.abi3.so: "
+            "_Unwind_Backtrace@GCC_4.9.0, "
+            "_ZSt28__throw_bad_array_new_lengthv@GLIBCXX_3.4.29, "
+            "_ZdlPvm@CXXABI_1.3.9, fstat@GLIBC_2.33, pthread_once@GLIBC_2.34"
+        )
+        with pytest.raises(ValueError, match=f"^{re.escape(expected_multi_msg)}$"):
+            release_checks.validate_release_artifacts(
+                dist_dir=multi_lib_dir,
+                expected_version="0.0.10b1",
+                repo_root=multi_lib_dir,
+            )
+
+        # When checkout CUDA 13 extensions are built on disk, cross-check against independent readelf oracle.
+        if shutil.which("readelf") is not None:
+            arch_by_machine = {
+                machine: arch
+                for arch, machine in release_checks._ELF_MACHINE_BY_ARCHITECTURE.items()
+            }
+            repo_root = Path(__file__).resolve().parents[4]
+            host_cu13 = sorted(repo_root.glob("torch_memory_saver_hook_mode_*_cu13.abi3.so"))
+            for so_path in host_cu13:
+                so_bytes = so_path.read_bytes()
+                machine = release_checks._read_elf_machine(
+                    binary=so_bytes, source=so_path.name
+                )
+                arch = arch_by_machine.get(machine)
+                if arch is None:
+                    continue
+                offenders = _readelf_post_manylinux2014_offenders(so_path)
+                iso_dir = tmp_path / f"real_ext_{so_path.stem}"
+                iso_dir.mkdir()
+                _write_release_artifacts(dist_dir=iso_dir, version="0.0.10b1")
+                iso_wheel = (
+                    iso_dir
+                    / f"torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_{arch}.whl"
+                )
+                _rewrite_wheel_file(
+                    wheel_path=iso_wheel,
+                    target_name=so_path.name,
+                    content=so_bytes,
+                )
+                if offenders:
+                    expected_msg = (
+                        f"Forbidden post-manylinux2014 symbol/ABI requirement in "
+                        f"{iso_wheel.name}:{so_path.name}: {', '.join(offenders)}"
+                    )
+                    with pytest.raises(ValueError, match=f"^{re.escape(expected_msg)}$"):
+                        release_checks.validate_release_artifacts(
+                            dist_dir=iso_dir,
+                            expected_version="0.0.10b1",
+                            repo_root=iso_dir,
+                        )
+                else:
+                    release_checks.validate_release_artifacts(
+                        dist_dir=iso_dir,
+                        expected_version="0.0.10b1",
+                        repo_root=iso_dir,
+                    )
+
+        # Unconditional clean multi-library ELF regression (verifies zero false rejections).
+        clean_multi_dir = tmp_path / "clean_multi_lib_elf"
+        clean_multi_dir.mkdir()
+        _write_release_artifacts(dist_dir=clean_multi_dir, version="0.0.10b1")
+        _rewrite_wheel_file(
+            wheel_path=(
+                clean_multi_dir
+                / "torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_x86_64.whl"
+            ),
+            target_name="torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+            content=_elf_header(
+                architecture="x86_64",
+                undefined_symbols=(
+                    "clock_gettime",
+                    "_Znwm",
+                    "__cxa_thread_atexit",
+                    "_ITM_registerTMCloneTable",
+                    "_Unwind_Resume",
+                ),
+                verneed_libraries=(
+                    ("libc.so.6", ("GLIBC_2.2.5", "GLIBC_2.17")),
+                    (
+                        "libstdc++.so.6",
+                        ("GLIBCXX_3.4.19", "CXXABI_1.3.7", "CXXABI_TM_1"),
+                    ),
+                    ("libgcc_s.so.1", ("GCC_4.8.0",)),
+                ),
+                undefined_ver_indices=(3, 4, 5, 6, 7),
+            ),
+        )
+        release_checks.validate_release_artifacts(
+            dist_dir=clean_multi_dir,
+            expected_version="0.0.10b1",
+            repo_root=clean_multi_dir,
+        )
+
+    def test_wheel_binary_leaking_internal_cpp_symbol_is_rejected(self, tmp_path: Path) -> None:
+        """Wheel binaries must not export internal C++ symbols such as TorchMemorySaver::instance()."""
+
+        _write_release_artifacts(dist_dir=tmp_path, version="0.0.10b1")
+        wheel_path = (
+            tmp_path / "torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_x86_64.whl"
+        )
+        for sym in (
+            "_ZN16TorchMemorySaver8instanceEv",
+            "_ZN14DiskBackupSlotD1Ev",
+            "_ZN18AllocationMetadataD1Ev",
+            "_ZN17ThreadLocalConfigD1Ev",
+        ):
+            for elf_kwargs in (
+                {"defined_symbols": (sym,)},
+                {"defined_symbols": (sym,), "defined_binding": 10},
+                {"undefined_symbols": (sym,)},
+            ):
+                _rewrite_wheel_file(
+                    wheel_path=wheel_path,
+                    target_name="torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+                    content=_elf_header(
+                        architecture="x86_64",
+                        **elf_kwargs,
+                    ),
+                )
+
+                with pytest.raises(
+                    ValueError,
+                    match=rf"Leaked internal C\+\+ symbol.*{sym}",
+                ):
+                    release_checks.validate_release_artifacts(
+                        dist_dir=tmp_path,
+                        expected_version="0.0.10b1",
+                        repo_root=tmp_path,
+                    )
+
     def test_unsuffixed_binary_must_equal_cuda12_binary(self, tmp_path: Path) -> None:
         """The historical preload name remains a byte-identical CUDA 12 alias."""
 
@@ -870,10 +1209,184 @@ def _corrupt_wheel_record(*, wheel_path: Path, field: str) -> None:
             wheel.writestr(name, content)
 
 
-def _elf_header(*, architecture: str) -> bytes:
-    binary = bytearray(20)
-    binary[:7] = b"\x7fELF\x02\x01\x01"
-    binary[18:20] = release_checks._ELF_MACHINE_BY_ARCHITECTURE[architecture].to_bytes(
+def _readelf_post_manylinux2014_offenders(so_path: Path) -> list[str]:
+    ceilings = {
+        "GLIBC": (2, 17),
+        "CXXABI": (1, 3, 7),
+        "GLIBCXX": (3, 4, 19),
+        "GCC": (4, 8, 0),
+    }
+
+    def _over(ver_tag: str) -> bool:
+        if ver_tag == "CXXABI_TM_1":
+            return False
+        for fam, max_ver in ceilings.items():
+            if ver_tag.startswith(f"{fam}_"):
+                parts = ver_tag[len(fam) + 1 :].split(".")
+                if not parts or any(not p or not p.isdigit() for p in parts):
+                    return True
+                return tuple(int(p) for p in parts) > max_ver
+        return False
+
+    dyn_syms = subprocess.run(
+        ["readelf", "--dyn-syms", "-W", str(so_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    offenders: set[str] = set()
+    covered_tags: set[str] = set()
+    for line in dyn_syms.splitlines():
+        cols = line.split()
+        if len(cols) >= 8 and cols[6] == "UND":
+            sym = cols[7]
+            if sym.split("@", 1)[0] in ("statx", "getdents64", "getrandom"):
+                offenders.add(sym)
+            if "@" in sym:
+                tag = sym.rsplit("@", 1)[-1]
+                if _over(tag):
+                    offenders.add(sym)
+                    covered_tags.add(tag)
+
+    ver_out = subprocess.run(
+        ["readelf", "-V", "-W", str(so_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    in_verneed = False
+    for line in ver_out.splitlines():
+        if "Version needs section" in line:
+            in_verneed = True
+            continue
+        if "Version definition section" in line or "Version symbols section" in line:
+            in_verneed = False
+            continue
+        if in_verneed:
+            cols = line.split()
+            if "Name:" in cols:
+                idx = cols.index("Name:")
+                if idx + 1 < len(cols):
+                    tag = cols[idx + 1]
+                    if tag not in covered_tags and _over(tag):
+                        offenders.add(tag)
+    return sorted(offenders)
+
+
+def _elf_header(
+    *,
+    architecture: str,
+    undefined_symbols: tuple[str, ...] = (),
+    defined_symbols: tuple[str, ...] = (),
+    defined_binding: int = 1,
+    verneed_versions: tuple[str, ...] = (),
+    verneed_libraries: tuple[tuple[str, tuple[str, ...]], ...] = (),
+    undefined_ver_indices: tuple[int, ...] = (),
+) -> bytes:
+    import struct
+
+    dynstr = bytearray(b"\x00")
+    entries: list[tuple[int, int, int]] = []
+    for symbol in undefined_symbols:
+        entries.append((len(dynstr), 0x12, 0))
+        dynstr.extend(symbol.encode("utf-8"))
+        dynstr.append(0)
+    defined_info = ((defined_binding & 0xF) << 4) | 0x2
+    for symbol in defined_symbols:
+        entries.append((len(dynstr), defined_info, 1))
+        dynstr.extend(symbol.encode("utf-8"))
+        dynstr.append(0)
+
+    resolved_verneeds = verneed_libraries or (
+        (("libc.so.6", verneed_versions),) if verneed_versions else ()
+    )
+    verneed_bytes = bytearray()
+    if resolved_verneeds:
+        ver_idx_cursor = 2
+        for lib_idx, (lib_name, vers) in enumerate(resolved_verneeds):
+            lib_name_off = len(dynstr)
+            dynstr.extend(lib_name.encode("utf-8"))
+            dynstr.append(0)
+            ver_name_offs: list[int] = []
+            for ver in vers:
+                ver_name_offs.append(len(dynstr))
+                dynstr.extend(ver.encode("utf-8"))
+                dynstr.append(0)
+            vn_next = (16 + 16 * len(vers)) if lib_idx + 1 < len(resolved_verneeds) else 0
+            verneed_bytes.extend(
+                struct.pack("<HHIII", 1, len(vers), lib_name_off, 16, vn_next)
+            )
+            for idx, name_off in enumerate(ver_name_offs):
+                next_off = 16 if idx + 1 < len(ver_name_offs) else 0
+                verneed_bytes.extend(
+                    struct.pack("<IHHIi", 0, 0, ver_idx_cursor, name_off, next_off)
+                )
+                ver_idx_cursor += 1
+
+    dynstr_offset = 64
+    pad = (-len(dynstr)) % 8
+    dynsym_offset = dynstr_offset + len(dynstr) + pad
+
+    dynsym = bytearray(24)
+    for name_offset, st_info, shndx in entries:
+        dynsym.extend(struct.pack("<IBBHQQ", name_offset, st_info, 0, shndx, 0, 0))
+
+    cursor = dynsym_offset + len(dynsym)
+    shdrs = bytearray(64)
+    # section 1: .dynstr (SHT_STRTAB)
+    shdrs.extend(struct.pack("<IIQQQQIIQQ", 0, 3, 0, 0, dynstr_offset, len(dynstr), 0, 0, 1, 0))
+    # section 2: .dynsym (SHT_DYNSYM, link=1)
+    shdrs.extend(struct.pack("<IIQQQQIIQQ", 0, 11, 0, 0, dynsym_offset, len(dynsym), 1, 1, 8, 24))
+    extra_bytes = bytearray()
+    sh_count = 3
+
+    if resolved_verneeds:
+        verneed_offset = cursor
+        extra_bytes.extend(verneed_bytes)
+        cursor += len(verneed_bytes)
+        shdrs.extend(
+            struct.pack(
+                "<IIQQQQIIQQ",
+                0,
+                0x6FFFFFFE,
+                0,
+                0,
+                verneed_offset,
+                len(verneed_bytes),
+                1,
+                len(resolved_verneeds),
+                4,
+                0,
+            )
+        )
+        sh_count += 1
+
+    if undefined_ver_indices:
+        versym = bytearray(struct.pack("<H", 0))
+        for ver_idx in undefined_ver_indices:
+            versym.extend(struct.pack("<H", ver_idx))
+        for _ in defined_symbols:
+            versym.extend(struct.pack("<H", 1))
+        versym_offset = cursor
+        extra_bytes.extend(versym)
+        cursor += len(versym)
+        shdrs.extend(
+            struct.pack("<IIQQQQIIQQ", 0, 0x6FFFFFFF, 0, 0, versym_offset, len(versym), 2, 0, 2, 2)
+        )
+        sh_count += 1
+
+    shoff = cursor
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    header[18:20] = release_checks._ELF_MACHINE_BY_ARCHITECTURE[architecture].to_bytes(
         length=2, byteorder="little"
     )
-    return bytes(binary)
+    struct.pack_into("<QIHHHHHH", header, 40, shoff, 0, 64, 0, 0, 64, sh_count, 0)
+    return (
+        bytes(header)
+        + bytes(dynstr)
+        + (b"\x00" * pad)
+        + bytes(dynsym)
+        + bytes(extra_bytes)
+        + bytes(shdrs)
+    )

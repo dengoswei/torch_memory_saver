@@ -1,5 +1,5 @@
-#include "hardware_xpu_support.h"
 #include "core.h"
+#include "hardware_xpu_support.h"
 
 #if defined(USE_XPU)
 
@@ -165,7 +165,7 @@ cudaError_t xpu_malloc(
       metadata.xpu.ze_ctx = pdc.ze_ctx;
       metadata.xpu.ze_dev = pdc.ze_dev;
       metadata.xpu.ze_phys = phys;
-      allocation_metadata.emplace(*ptr, metadata);
+      allocation_metadata.emplace(*ptr, std::move(metadata));
     }
     XPU_LOG("malloc ptr=" << *ptr << " size=" << size << " aligned=" << aligned
                           << " tag=" << tag);

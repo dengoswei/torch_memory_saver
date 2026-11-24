@@ -82,7 +82,7 @@ torch_memory_saver.resume()
 assert tensor1[0] == 42, "content is kept unchanged"
 ```
 
-The default host shadow is pinned (`cpu_backup_backend="pinned"`). If process RSS remains resident after a non-retaining resume with the pinned backend, CUDA/MUSA users can select `cpu_backup_backend="mmap"` (or `TMS_INIT_CPU_BACKUP_BACKEND=mmap`) so releasing the host shadow uses `munmap` instead of `cudaFreeHost`. Both backends release the host shadow on resume unless retention is enabled.
+The default host shadow is pinned (`cpu_backup_backend="pinned"`). If process RSS remains resident after a non-retaining resume with the pinned backend, CUDA/MUSA/MLU users can select `cpu_backup_backend="mmap"` (or `TMS_INIT_CPU_BACKUP_BACKEND=mmap`) so releasing the host shadow uses `munmap` instead of `cudaFreeHost`. Both backends release mutable (`write_once=False`) host shadows on resume unless `retain_cpu_backup` is enabled.
 
 ```python
 with torch_memory_saver.region(enable_cpu_backup=True, cpu_backup_backend="mmap"):
@@ -104,11 +104,26 @@ Set `TMS_RETAIN_CPU_BACKUP=1` before process startup to enable the same policy,
 including for preload mode. Retention needs CUDA, MUSA, MLU or ROCm 7+ and can consume host RAM
 equal to the backed-up allocations. While enabled, `get_cpu_backup` continues
 to expose the retained backup after resume. Without retention on CUDA, MUSA, MLU or ROCm 7+,
-`get_cpu_backup` is only valid while allocations are paused.
+`get_cpu_backup` for mutable (`write_once=False`) allocations is only valid while
+paused; `write_once=True` CPU backups stay retained across resume until freed.
 
-The retention policy is consulted on resume. Setting it to `False` does not eagerly free
-backups for active allocations; they are released by a later non-retaining
-resume, when the allocation is freed, or when the process exits.
+The resume-time release policy applies only to mutable (`write_once=False`) CPU backups; `write_once=True` CPU backups always stay retained across `resume()` until the allocation is freed. Setting `retain_cpu_backup` to `False` does not eagerly free active mutable backups; they are released on a later non-retaining `resume()`, when the allocation is freed, or when the process exits.
+
+### Direct Disk Backup and Write-Once Regions
+
+Pass `backup="none"` (default), `"cpu"`, `"cpu_mmap"`, or `"disk"` to `region()`, and set `write_once=True` on CPU or disk regions for frozen weights so only the first `pause()` writes the backup while later pauses skip redundant copies:
+
+```python
+torch_memory_saver.clear_disk_backup_dir("/mnt/nvme/tms_spill")  # optional startup cleanup
+torch_memory_saver.configure_direct_disk_backup("/mnt/nvme/tms_spill")
+
+with torch_memory_saver.region(tag="frozen", backup="disk", write_once=True):
+    frozen_weights = torch.empty((1024, 1024), device="cuda")
+```
+
+- `backup` cannot be combined with `enable_cpu_backup` or `enable_disk_backup`, `backup="cpu_mmap"` cannot be combined with `cpu_backup_backend`, and `write_once` cannot be combined with `readonly_disk_backup`.
+- `write_once=True` regions must exit before `pause()`, cannot nest with `region()`, `disable()`, or `cuda_graph()`, and require PyTorch `>= 2.8.0` in `hook_mode="torch"` (unsupported on XPU, MUSA, MLU, and ROCm `< 7.0`).
+- `backup="disk"` requires Linux CUDA on a non-`tmpfs`/`ramfs` filesystem supporting `STATX_DIOALIGN`. Configure a directory first via `configure_direct_disk_backup(path, numa_node=None)`, `set_disk_backup_dir(path)`, or `TMS_DISK_BACKUP_DIR`; placement is process-wide immutable once configured. Spill files live in per-process `pid_<pid>/slot_<id>.bin` subdirectories, open only during transfers (`O_DIRECT | O_CLOEXEC`), release on `resume()` for mutable allocations or `free()`/`exit` for `write_once`, and stale crash directories can be purged on startup via `clear_disk_backup_dir(path)`.
 
 ### Hook Modes
 
