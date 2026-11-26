@@ -513,7 +513,6 @@ import sys
 from pathlib import Path
 import torch
 import torch_memory_saver
-from torch_memory_saver.entrypoint import _PoolKey, _StorageMode
 sys.path.insert(0, str(Path(torch_memory_saver.__file__).resolve().parents[1] / "test" / "examples"))
 from cpu_backup import _mlu_host_pointer_is_allocated
 saver = torch_memory_saver.torch_memory_saver
@@ -537,7 +536,7 @@ if not PAUSED:
     assert torch.all(tensor == 7).item()
     assert saver.get_cpu_backup(tensor, zero_copy=True).data_ptr() == pointer
 assert saver._impl._affected_devices("outside_free") == [0]
-pool = saver._impl._mem_pools.pop(_PoolKey("outside_free", 0, _StorageMode.CPU_PINNED))
+pool = saver._impl._mem_pools.pop(("outside_free", True, False, "pinned", 0))
 torch.mlu.synchronize()
 del backup, tensor, pool
 gc.collect()

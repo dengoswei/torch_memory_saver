@@ -1,22 +1,12 @@
 import ctypes
 import logging
-import os
-import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-def _is_rocm_legacy_chunked(hip_version: Optional[str]) -> bool:
-    if not hip_version:
-        return False
-    match = re.match(r"^\s*(\d+)", str(hip_version))
-    return match is None or int(match.group(1)) < 7
-
-
 class BinaryWrapper:
     def __init__(self, path_binary: str):
-        self._resolved_binary_path = os.path.realpath(path_binary)
         try:
             self.cdll = ctypes.CDLL(path_binary)
         except OSError as e:
@@ -33,15 +23,13 @@ class BinaryWrapper:
         enable_cpu_backup: bool,
         cpu_backup_backend: Optional[str] = None,
         enable_disk_backup: bool = False,
-        write_once: bool = False,
     ):
-        self.cdll.tms_set_current_tag(tag.encode("utf-8", errors="strict"))
+        self.cdll.tms_set_current_tag(tag.encode("utf-8"))
         self.cdll.tms_set_interesting_region(interesting_region)
         self.cdll.tms_set_enable_cpu_backup(enable_cpu_backup)
         if cpu_backup_backend is not None:
             self.cdll.tms_set_cpu_backup_backend(cpu_backup_backend.encode("utf-8"))
         self.cdll.tms_set_enable_disk_backup(enable_disk_backup)
-        self.cdll.tms_set_write_once(write_once)
 
 
 def _setup_function_signatures(cdll):
@@ -56,18 +44,7 @@ def _setup_function_signatures(cdll):
     cdll.tms_get_cpu_backup_backend.restype = ctypes.c_char_p
     cdll.tms_set_enable_disk_backup.argtypes = [ctypes.c_bool]
     cdll.tms_get_enable_disk_backup.restype = ctypes.c_bool
-    cdll.tms_set_write_once.argtypes = [ctypes.c_bool]
-    cdll.tms_get_write_once.restype = ctypes.c_bool
-    cdll.tms_supports_write_once.argtypes = []
-    cdll.tms_supports_write_once.restype = ctypes.c_bool
     cdll.tms_set_disk_backup_dir.argtypes = [ctypes.c_char_p]
-    cdll.tms_set_disk_backup_dir.restype = None
-    cdll.tms_set_disk_backup_dir_checked.argtypes = [ctypes.c_char_p]
-    cdll.tms_set_disk_backup_dir_checked.restype = ctypes.c_char_p
-    cdll.tms_configure_direct_disk_backup.argtypes = [ctypes.c_char_p, ctypes.c_int]
-    cdll.tms_configure_direct_disk_backup.restype = ctypes.c_char_p
-    cdll.tms_get_disk_backup_info.argtypes = []
-    cdll.tms_get_disk_backup_info.restype = ctypes.c_char_p
     cdll.tms_pause.argtypes = [ctypes.c_char_p]
     cdll.tms_pause.restype = ctypes.c_int
     cdll.tms_resume.argtypes = [ctypes.c_char_p]
