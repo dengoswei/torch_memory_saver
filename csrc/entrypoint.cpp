@@ -55,12 +55,21 @@ public:
         enable_disk_backup_ = value;
     }
 
+    bool write_once() const {
+        return write_once_;
+    }
+
+    void set_write_once(bool value) {
+        write_once_ = value;
+    }
+
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
     CpuBackupKind cpu_backup_kind_ = cpu_backup_kind_from_str(
         std::getenv("TMS_INIT_CPU_BACKUP_BACKEND"));
     std::optional<bool> enable_disk_backup_;
+    bool write_once_ = false;
 };
 static thread_local ThreadLocalConfig thread_local_config;
 
@@ -77,7 +86,7 @@ cudaError_t cudaMalloc(void **ptr, size_t size) {
         return TorchMemorySaver::instance().malloc(
             ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_,
             thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-            thread_local_config.enable_disk_backup());
+            thread_local_config.enable_disk_backup(), thread_local_config.write_once());
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -101,7 +110,7 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
         &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
         thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-        thread_local_config.enable_disk_backup()));
+        thread_local_config.enable_disk_backup(), thread_local_config.write_once()));
     return ptr;
 }
 
@@ -110,9 +119,6 @@ void tms_torch_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
     std::cout << "[torch_memory_saver.cpp] entrypoint::tms_torch_free "
               << " ptr=" << ptr << " ssize=" << ssize << " device=" << device << " stream=" << stream
               << std::endl;
-#endif
-#if !defined(USE_XPU) && !defined(USE_MLU)
-    SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
 #endif
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().free(ptr));
 }
@@ -163,9 +169,50 @@ void tms_set_enable_disk_backup(bool enable_disk_backup) {
     thread_local_config.set_enable_disk_backup(enable_disk_backup);
 }
 
+bool tms_get_write_once() {
+    return thread_local_config.write_once();
+}
+
+void tms_set_write_once(bool write_once) {
+    thread_local_config.set_write_once(write_once);
+}
+
+bool tms_supports_write_once() {
+#if TMS_ROCM_LEGACY_CHUNKED || defined(USE_XPU) || defined(USE_MUSA) || defined(USE_MLU)
+    return false;
+#else
+    return true;
+#endif
+}
+
+// NULL means success; returned strings remain valid until the next call on this thread.
+const char* tms_configure_direct_disk_backup(const char* dir, int numa_node) {
+    static thread_local std::string error;
+    try {
+        if (!dir) throw std::invalid_argument("disk directory is null");
+        TorchMemorySaver::instance().configure_direct_disk_backup(dir, numa_node);
+        return nullptr;
+    } catch (const std::exception& e) { error = e.what(); return error.c_str(); }
+}
+const char* tms_get_disk_backup_info() {
+    static thread_local std::string info;
+    info = TorchMemorySaver::instance().get_disk_backup_info();
+    return info.c_str();
+}
+
 void tms_set_disk_backup_dir(const char* dir) {
     SIMPLE_CHECK(dir != nullptr, "disk backup dir should not be null");
-    TorchMemorySaver::instance().set_disk_backup_dir(std::string(dir));
+    try { TorchMemorySaver::instance().set_disk_backup_dir(std::string(dir)); }
+    catch (const std::exception& e) { SIMPLE_CHECK(false, e.what()); }
+}
+
+const char* tms_set_disk_backup_dir_checked(const char* dir) {
+    static thread_local std::string error;
+    try {
+        if (!dir) throw std::invalid_argument("disk backup dir should not be null");
+        TorchMemorySaver::instance().set_disk_backup_dir(std::string(dir));
+        return nullptr;
+    } catch (const std::exception& e) { error = e.what(); return error.c_str(); }
 }
 
 void set_memory_margin_bytes(uint64_t value) {

@@ -49,9 +49,11 @@ struct AllocationMetadata {
     size_t allocation_size;
     CUmemGenericAllocationHandle allocHandle;
 #endif
+    // Write-once backup (CPU or disk): first pause writes; later pauses skip copy/write.
+    bool write_once = false;
 };
 
-class TorchMemorySaver {
+class TMS_HIDDEN TorchMemorySaver {
 public:
     static TorchMemorySaver& instance();
 
@@ -62,7 +64,8 @@ public:
         const std::string& tag,
         bool enable_cpu_backup,
         CpuBackupKind cpu_backup_kind,
-        bool enable_disk_backup);
+        bool enable_disk_backup,
+        bool write_once = false);
     cudaError_t free(void *ptr);
 
     cudaError_t pause(const std::string& tag);
@@ -89,6 +92,16 @@ public:
         return retain_cpu_backup_.load();
     }
     uint8_t* get_cpu_backup_pointer(const uint8_t* query_gpu_ptr, uint64_t query_size);
+    void configure_direct_disk_backup(
+        const std::string& dir,
+        int numa_node = DiskBackend::kAutoNumaNode) {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        disk_backend_.configure(dir, numa_node);
+    }
+    std::string get_disk_backup_info() {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        return disk_backend_.info();
+    }
     void set_disk_backup_dir(const std::string& dir) {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
         disk_backend_.set_dir(dir);

@@ -8,7 +8,7 @@ import sys
 import traceback
 import torch
 import torch_memory_saver
-from torch_memory_saver.testing_utils import get_device_module, is_musa, is_xpu
+from torch_memory_saver.testing_utils import get_device_module, is_mlu, is_musa, is_xpu
 from torch_memory_saver.utils import change_env
 
 from examples import (
@@ -114,10 +114,51 @@ def test_cpu_backup_preload_backend_from_env():
         _test_core(cpu_backup.run_preload_backend_from_env, hook_mode="preload")
 
 
+@_skip_on_xpu
+@_skip_on_musa
 @_skip_on_lupine
+@pytest.mark.skipif(
+    sys.platform != "linux" or torch.version.hip is not None or is_mlu(),
+    reason="Direct disk backup is Linux CUDA-only",
+)
 @pytest.mark.parametrize("hook_mode", _HOOK_MODES)
 def test_disk_backup(hook_mode):
     _test_core(disk_backup.run, hook_mode=hook_mode)
+
+
+@_skip_on_xpu
+@_skip_on_musa
+@_skip_on_lupine
+@pytest.mark.skipif(
+    sys.platform != "linux" or torch.version.hip is not None or is_mlu(),
+    reason="Direct disk backup is Linux CUDA-only",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_disk_backup_auto_numa_and_multi_instance(hook_mode):
+    _test_core(disk_backup.run_auto_numa_and_multi_instance, hook_mode=hook_mode)
+
+
+@_skip_on_xpu
+@_skip_on_musa
+@_skip_on_lupine
+@pytest.mark.skipif(
+    sys.platform != "linux" or torch.version.hip is not None or is_mlu(),
+    reason="Direct disk backup is Linux CUDA-only",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_disk_backup_env_and_set_dir_auto_configure(hook_mode):
+    _test_core(disk_backup.run_env_and_set_dir_auto_configure, hook_mode=hook_mode)
+
+
+@_skip_on_xpu
+@_skip_on_musa
+@pytest.mark.skipif(
+    is_mlu() or (torch.version.hip is not None and int(torch.version.hip.split(".", 1)[0]) < 7),
+    reason="write_once requires CUDA or ROCm >= 7.0",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_cpu_backup_write_once(hook_mode):
+    _test_core(cpu_backup.run_write_once, hook_mode=hook_mode)
 
 
 @_skip_on_xpu
@@ -265,7 +306,11 @@ def _run_in_subprocess(fn, fn_kwargs):
     proc = ctx.Process(target=_subprocess_fn_wrapper, args=(fn, fn_kwargs, output_queue))
     proc.start()
     proc.join()
-    success = output_queue.get() if fn_kwargs.get("hook_mode", "torch") == "torch" else proc.exitcode == 0
+    success = (
+        (proc.exitcode == 0 and output_queue.get())
+        if fn_kwargs.get("hook_mode", "torch") == "torch"
+        else proc.exitcode == 0
+    )
     assert success
 
 
