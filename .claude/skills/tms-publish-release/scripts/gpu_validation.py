@@ -32,11 +32,7 @@ _RUNTIME_TEST_MODULES = (
     "test_preload_hook_loader.py",
     "test_utils.py",
 )
-_BUILD_TOOL_TEST_MODULES = (
-    "test_direct_disk_native.py",
-    "test_merge_cuda_wheels.py",
-    "test_setup_rpath.py",
-)
+_BUILD_TOOL_TEST_MODULES = ("test_merge_cuda_wheels.py", "test_setup_rpath.py")
 # Backend-specific tests are classified but not shipped to CUDA validation containers.
 _NON_CUDA_TEST_MODULES = ("test_mlu.py",)
 _MULTI_DEVICE_SKIP_REASON = "Multi-device test requires at least two devices"
@@ -84,12 +80,7 @@ _EXPECTED_LUPINE_SKIPS = (
         _LUPINE_SKIP_REASON,
     ),
     *(
-        (f"test/test_examples.py::{test_name}[{hook_mode}]", _LUPINE_SKIP_REASON)
-        for test_name in (
-            "test_disk_backup",
-            "test_disk_backup_auto_numa_and_multi_instance",
-            "test_disk_backup_env_and_set_dir_auto_configure",
-        )
+        (f"test/test_examples.py::test_disk_backup[{hook_mode}]", _LUPINE_SKIP_REASON)
         for hook_mode in ("preload", "torch")
     ),
 )
@@ -372,8 +363,6 @@ def _run_x86_case(*, config: GpuValidationConfig, case: GpuValidationCase) -> No
                 "device=0",
                 "--network",
                 "host",
-                "--cap-add",
-                "SYS_NICE",
                 *_environment_args(
                     config=config,
                     case=case,

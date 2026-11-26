@@ -45,7 +45,6 @@ for runtime in \
   docker run --rm --pull missing \
     --gpus device=0 \
     --network host \
-    --cap-add SYS_NICE \
     -e "http_proxy=$PROXY_URL" \
     -e "https_proxy=$PROXY_URL" \
     -e "TMS_RELEASE_VERSION=$RELEASE_VERSION" \

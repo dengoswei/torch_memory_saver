@@ -50,7 +50,6 @@ private:
     bool matches_configured_dir_(const std::string& dir) const noexcept;
     bool owns_process_resources_() const noexcept;
     void ensure_staging_buf_();
-    void verify_numa_() const;
     void check_fd_(int fd);
     void stream_(int fd, void* gpu_ptr, size_t size, bool to_disk);
 

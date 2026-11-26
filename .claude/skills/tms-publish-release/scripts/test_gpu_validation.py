@@ -236,8 +236,6 @@ class TestGpuValidationCommand:
         assert marked_tests == {
             "test_cpu_backup_preload_backend_from_env",
             "test_disk_backup",
-            "test_disk_backup_auto_numa_and_multi_instance",
-            "test_disk_backup_env_and_set_dir_auto_configure",
         }
 
     def test_skip_gate_accepts_only_the_exact_node_and_reason_map(self) -> None:
@@ -471,9 +469,6 @@ class TestGpuValidationCommand:
         assert "--name" in run_command
         assert ["--gpus", "device=0"] == run_command[
             run_command.index("--gpus") : run_command.index("--gpus") + 2
-        ]
-        assert ["--cap-add", "SYS_NICE"] == run_command[
-            run_command.index("--cap-add") : run_command.index("--cap-add") + 2
         ]
         assert f"{config.release_root}:/workspace:ro" in run_command
         assert f"TMS_CUDA_MAJOR={case.cuda_major}" in run_command

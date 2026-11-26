@@ -123,7 +123,7 @@ with torch_memory_saver.region(tag="frozen", backup="disk", write_once=True):
 
 - `backup` cannot be combined with `enable_cpu_backup` or `enable_disk_backup`, `backup="cpu_mmap"` cannot be combined with `cpu_backup_backend`, and `write_once` cannot be combined with `readonly_disk_backup`.
 - `write_once=True` regions must exit before `pause()`, cannot nest with `region()`, `disable()`, or `cuda_graph()`, and require PyTorch `>= 2.8.0` in `hook_mode="torch"` (unsupported on XPU, MUSA, MLU, and ROCm `< 7.0`).
-- `backup="disk"` requires Linux CUDA on a non-`tmpfs`/`ramfs` filesystem supporting `STATX_DIOALIGN`. Configure a directory first via `configure_direct_disk_backup(path, numa_node=None)`, `set_disk_backup_dir(path)`, or `TMS_DISK_BACKUP_DIR`; placement is process-wide immutable once configured. Spill files live in per-process `pid_<pid>/slot_<id>.bin` subdirectories, open only during transfers (`O_DIRECT | O_CLOEXEC`), release on `resume()` for mutable allocations or `free()`/`exit` for `write_once`, and stale crash directories can be purged on startup via `clear_disk_backup_dir(path)`.
+- `backup="disk"` requires Linux CUDA on a non-`tmpfs`/`ramfs` filesystem supporting `STATX_DIOALIGN`. Configure a directory first via `configure_direct_disk_backup(path, numa_node=None)`, `set_disk_backup_dir(path)`, or `TMS_DISK_BACKUP_DIR`; placement is process-wide immutable once configured. Spill files live in per-process `pid_<pid>_<id>/slot_<n>.bin` subdirectories, open only during transfers (`O_DIRECT | O_CLOEXEC`), release on `resume()` for mutable allocations or `free()`/`exit` for `write_once`, and stale crash directories can be purged on startup via `clear_disk_backup_dir(path)`.
 
 ### Hook Modes
 

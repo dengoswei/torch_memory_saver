@@ -196,37 +196,6 @@ void reject_tmpfs_before_mkdir(const std::string& dir) {
     }
 }
 #endif
-
-#if defined(__linux__)
-template <typename MovePagesFn>
-void verify_staging_pages_numa(
-    void* buf, size_t chunk_bytes, size_t page_bytes, int expected_node, MovePagesFn&& move_pages_fn
-) {
-    const size_t count = chunk_bytes / page_bytes;
-    std::vector<void*> pages(count);
-    std::vector<int> status(count, -1);
-    for (size_t i = 0; i < count; ++i) pages[i] = static_cast<uint8_t*>(buf) + i * page_bytes;
-    // SMMUv3/ATS cudaHostRegister leaves VmPin=0; reading a -ENOENT page waits on any
-    // in-flight kernel compaction/THP migration PTE before re-checking NUMA residency.
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        system_check(move_pages_fn(count, pages.data(), status.data()) == 0,
-                     "move_pages query after cudaHostRegister");
-        bool saw_enoent = false;
-        for (size_t i = 0; i < count; ++i) {
-            if (status[i] == -ENOENT && attempt + 1 < 8) {
-                (void)*static_cast<const volatile uint8_t*>(pages[i]);
-                saw_enoent = true;
-            }
-        }
-        if (!saw_enoent) break;
-        sched_yield();
-    }
-    for (int node : status) {
-        require(node == expected_node,
-                "staging page outside requested NUMA node (observed " + std::to_string(node) + ")");
-    }
-}
-#endif
 }  // namespace
 
 std::string compute_disk_backup_dir_from_env() {
@@ -326,16 +295,6 @@ void DiskBackend::check_fd_(int fd) {
     last_fd_descriptor_flags_ = descriptor_flags;
 }
 
-void DiskBackend::verify_numa_() const {
-#if defined(USE_CUDA) && defined(__linux__)
-    verify_staging_pages_numa(
-        staging_buf_, chunk_bytes_, page_bytes_, numa_node_,
-        [](size_t count, void** pages, int* status) {
-            return syscall(SYS_move_pages, 0, count, pages, nullptr, status, 0);
-        });
-#endif
-}
-
 void DiskBackend::ensure_staging_buf_() {
 #if defined(USE_CUDA) && defined(__linux__)
     require(owns_process_resources_(), "inherited pre-fork disk backend cannot allocate staging buffer in child");
@@ -370,7 +329,31 @@ void DiskBackend::ensure_staging_buf_() {
         cudaError_t result = cudaHostRegister(aligned, chunk_bytes_, cudaHostRegisterPortable);
         require(result == cudaSuccess, std::string("cudaHostRegister: ") + cudaGetErrorString(result));
         staging_buf_ = aligned;
-        verify_numa_();
+
+        // SMMUv3/ATS cudaHostRegister leaves VmPin=0; fault in any -ENOENT page awaiting migration.
+        const size_t page_count = chunk_bytes_ / page_bytes_;
+        std::vector<void*> pages(page_count);
+        std::vector<int> status(page_count, -1);
+        for (size_t i = 0; i < page_count; ++i) {
+            pages[i] = static_cast<uint8_t*>(aligned) + i * page_bytes_;
+        }
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            system_check(syscall(SYS_move_pages, 0, page_count, pages.data(), nullptr, status.data(), 0) == 0,
+                         "move_pages query after cudaHostRegister");
+            bool saw_enoent = false;
+            for (size_t i = 0; i < page_count; ++i) {
+                if (status[i] == -ENOENT && attempt + 1 < 8) {
+                    (void)*static_cast<const volatile uint8_t*>(pages[i]);
+                    saw_enoent = true;
+                }
+            }
+            if (!saw_enoent) break;
+            sched_yield();
+        }
+        for (int node : status) {
+            require(node == numa_node_,
+                    "staging page outside requested NUMA node (observed " + std::to_string(node) + ")");
+        }
     } catch (...) {
         if (staging_buf_) cudaHostUnregister(staging_buf_);
         staging_buf_ = nullptr;
@@ -418,13 +401,16 @@ void DiskBackend::configure(
     std::string prev_dir = dir_;
     const int prev_numa = numa_node_;
     const pid_t self_pid = ::getpid();
-    std::string proc_dir = normalized + "/pid_" + std::to_string(static_cast<long long>(self_pid));
-    std::string probe_path = proc_dir + "/probe.bin";
+    std::string proc_dir;
+    std::string probe_path;
     int probe_fd = -1;
     try {
-        std::error_code ec;
-        std::filesystem::remove_all(proc_dir, ec);
-        std::filesystem::create_directories(proc_dir);
+        std::string proc_tmpl =
+            normalized + "/pid_" + std::to_string(static_cast<long long>(self_pid)) + "_XXXXXX";
+        char* created = ::mkdtemp(proc_tmpl.data());
+        system_check(created != nullptr, "mkdtemp disk spill directory");
+        proc_dir = created;
+        probe_path = proc_dir + "/probe.bin";
 
         dir_ = std::move(normalized);
         proc_dir_ = proc_dir;
@@ -456,7 +442,9 @@ void DiskBackend::configure(
         if (probe_fd >= 0) {
             (void)::close(probe_fd);
         }
-        (void)::unlink(probe_path.c_str());
+        if (!probe_path.empty()) {
+            (void)::unlink(probe_path.c_str());
+        }
         if (mapping_base_ != nullptr) {
             if (staging_buf_ != nullptr) cudaHostUnregister(staging_buf_);
             munmap(mapping_base_, mapping_bytes_);
@@ -465,8 +453,10 @@ void DiskBackend::configure(
         mapping_bytes_ = 0;
         page_bytes_ = 0;
         mem_alignment_ = io_alignment_ = 0;
-        std::error_code ec;
-        std::filesystem::remove_all(proc_dir, ec);
+        if (!proc_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(proc_dir, ec);
+        }
         proc_dir_.clear();
         owner_pid_ = 0;
         dir_ = std::move(prev_dir);
@@ -479,7 +469,6 @@ void DiskBackend::configure(
 
 void DiskBackend::stream_(int fd, void* gpu_ptr, size_t size, bool to_disk) {
     ensure_staging_buf_();
-    verify_numa_();
     for (size_t offset = 0; offset < size;) {
         size_t n = std::min(chunk_bytes_, size - offset);
         size_t padded = round_up(n, io_alignment_);
@@ -501,17 +490,12 @@ void DiskBackend::offload(void* gpu_ptr, size_t size, DiskBackupSlot& slot) {
     try {
         require(configured_, "direct disk backend is not configured");
         require(owns_process_resources_(), "inherited pre-fork disk backend cannot be used in child process");
+        require(!slot.populated && slot.path.empty(), "disk backup slot already populated");
         size_t padded = round_up(size, io_alignment_);
         require(padded <= static_cast<size_t>(std::numeric_limits<off_t>::max()), "file size overflow");
 
-        const bool was_populated = slot.populated;
-        const size_t prev_padded = slot.padded_bytes;
-        const bool assigned_new_path = slot.path.empty();
-        if (assigned_new_path) {
-            slot.path = proc_dir_ + "/slot_" + std::to_string(++next_slot_id_) + ".bin";
-        }
-
-        int fd = ::open(slot.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC, 0600);
+        std::string slot_path = proc_dir_ + "/slot_" + std::to_string(++next_slot_id_) + ".bin";
+        int fd = ::open(slot_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC, 0600);
         system_check(fd >= 0, "open O_DIRECT slot for write");
         try {
             check_fd_(fd);
@@ -524,19 +508,13 @@ void DiskBackend::offload(void* gpu_ptr, size_t size, DiskBackupSlot& slot) {
             if (fd >= 0) {
                 (void)::close(fd);
             }
-            if (!was_populated) {
-                (void)::unlink(slot.path.c_str());
-                if (assigned_new_path) {
-                    slot.path.clear();
-                }
-            }
+            (void)::unlink(slot_path.c_str());
             throw;
         }
 
-        if (!was_populated) {
-            ++active_slots_;
-        }
-        active_padded_bytes_ = active_padded_bytes_ - prev_padded + padded;
+        slot.path = std::move(slot_path);
+        ++active_slots_;
+        active_padded_bytes_ += padded;
         slot.logical_bytes = size;
         slot.padded_bytes = padded;
         slot.populated = true;
@@ -578,12 +556,11 @@ void DiskBackend::release(DiskBackupSlot& slot) {
             (void)::unlink(slot.path.c_str());
         }
         if (slot.populated) {
-            active_padded_bytes_ = (active_padded_bytes_ >= slot.padded_bytes)
-                ? (active_padded_bytes_ - slot.padded_bytes)
-                : 0;
-            if (active_slots_ > 0) {
-                --active_slots_;
-            }
+            SIMPLE_CHECK(
+                active_slots_ > 0 && active_padded_bytes_ >= slot.padded_bytes,
+                "disk backup active counter underflow");
+            active_padded_bytes_ -= slot.padded_bytes;
+            --active_slots_;
         }
         slot.path.clear();
         slot.logical_bytes = 0;

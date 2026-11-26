@@ -11,7 +11,6 @@ import re
 import shutil
 import sys
 import threading
-import traceback
 from typing import Literal, Optional, Tuple
 import weakref
 
@@ -28,34 +27,6 @@ _TAG_DEFAULT = "default"
 BackupMode = Literal["none", "cpu", "cpu_mmap", "disk"]
 CpuBackupBackend = Literal["mmap", "pinned"]
 _DISK_CONFIG_LOCK = threading.Lock()
-_DEVICE_POOL_META_LOCK = threading.Lock()
-_DEVICE_POOL_LOCKS: dict[Tuple[int, int], threading.RLock] = {}
-_ACTIVE_DEVICE_CAPTURES: dict[Tuple[int, int], int] = {}
-_RETIRED_DEVICE_MEM_POOLS: dict[Tuple[int, int], list] = {}
-
-
-def _get_device_pool_lock(dev_key: Tuple[int, int]) -> threading.RLock:
-    with _DEVICE_POOL_META_LOCK:
-        lock = _DEVICE_POOL_LOCKS.get(dev_key)
-        if lock is None:
-            lock = threading.RLock()
-            _DEVICE_POOL_LOCKS[dev_key] = lock
-        return lock
-
-
-def _decrement_and_drain_device_captures(
-    dev_key: Tuple[int, int], *, drain: bool = True
-) -> None:
-    remaining = _ACTIVE_DEVICE_CAPTURES.get(dev_key, 1) - 1
-    if remaining > 0:
-        _ACTIVE_DEVICE_CAPTURES[dev_key] = remaining
-    else:
-        _ACTIVE_DEVICE_CAPTURES.pop(dev_key, None)
-        if drain:
-            retired = _RETIRED_DEVICE_MEM_POOLS.pop(dev_key, None)
-            if retired:
-                retired.clear()
-                retired = None
 
 
 class _StorageMode(Enum):
@@ -129,43 +100,26 @@ def _read_disk_backup_info(cdll) -> dict:
     return json.loads(cdll.tms_get_disk_backup_info().decode("utf-8", errors="replace"))
 
 
-_PEP440_VERSION_RE = re.compile(
-    r"""
-    ^\s*v?
-    (?:
-        (?:(?P<epoch>[0-9]+)!)?
-        (?P<release>[0-9]+(?:\.[0-9]+)*)
-        (?P<pre>[-_\.]?(?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)[-_\.]?(?P<pre_n>[0-9]+)?)?
-        (?P<post>(?:-(?P<post_n1>[0-9]+))|(?:[-_\.]?(?P<post_l>post|rev|r)[-_\.]?(?P<post_n2>[0-9]+)?))?
-        (?P<dev>[-_\.]?(?P<dev_l>dev)[-_\.]?(?P<dev_n>[0-9]+)?)?
-    )
-    (?:\+(?P<local>[a-z0-9]+(?:[-_\.][a-z0-9]+)*))?
-    \s*$
-    """,
-    re.VERBOSE | re.IGNORECASE,
+_TORCH_VER_RE = re.compile(
+    r"^\s*v?(?:(\d+)!)?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.\d+)*(?:([ab]|rc|-rc|preview|\.dev).*)?(?:(?:\.post|post)\d+)?(?:\+[A-Za-z0-9._-]+|-\d[A-Za-z0-9._-]*)?\s*\Z",
+    re.IGNORECASE,
 )
+_SPILL_DIR_RE = re.compile(r"^pid_\d+(?:_[A-Za-z0-9]+)?\Z")
 
 
 def _torch_supports_detached_mempool_free() -> bool:
     # PyTorch < 2.8.0 final selects a MemPool block's deleter via active MemPoolContext,
     # so retiring the pool before tensor free dispatches plain cudaFree (pytorch/pytorch#146431).
-    match = _PEP440_VERSION_RE.fullmatch(str(getattr(torch, "__version__", "")))
+    match = _TORCH_VER_RE.match(str(getattr(torch, "__version__", "")))
     if match is None:
         return False
-    epoch = int(match.group("epoch") or 0)
-    release = [int(part) for part in match.group("release").split(".")]
-    while len(release) > 1 and release[-1] == 0:
-        release.pop()
-    key = (epoch, tuple(release))
-    if key > (0, (2, 8)):
-        return True
-    if key < (0, (2, 8)):
-        return False
-    if match.group("pre") is not None:
-        return False
-    if match.group("post") is not None:
-        return True
-    return match.group("dev") is None
+    ver = (
+        int(match.group(1) or 0),
+        int(match.group(2)),
+        int(match.group(3) or 0),
+        int(match.group(4) or 0),
+    )
+    return ver > (0, 2, 8, 0) or (ver == (0, 2, 8, 0) and match.group(5) is None)
 
 
 def _resolve_region_backup(
@@ -407,24 +361,24 @@ class TorchMemorySaver:
         if os.path.lexists(path) and not os.path.isdir(path):
             raise ValueError("disk backup path must be a directory")
         with _DISK_CONFIG_LOCK:
+            wrappers = list(_TorchMemorySaverImpl._loaded_wrappers.values())
             if self._impl is not None:
-                info = _read_disk_backup_info(self._impl._binary_wrapper.cdll)
-                if (
-                    info.get("direct")
-                    and os.path.exists(path)
-                    and os.path.realpath(path) == info.get("directory")
-                ):
+                wrappers.append(self._impl._binary_wrapper)
+            real_target = os.path.realpath(path) if os.path.exists(path) else None
+            for wrapper in wrappers:
+                info = _read_disk_backup_info(wrapper.cdll)
+                if info.get("direct") and real_target and real_target == info.get("directory"):
                     raise RuntimeError(
                         "cannot clear active configured disk backup directory in-process"
                     )
             if not os.path.isdir(path):
                 return
             for entry in os.listdir(path):
+                if not _SPILL_DIR_RE.match(entry):
+                    continue
                 entry_path = os.path.join(path, entry)
                 if os.path.isdir(entry_path) and not os.path.islink(entry_path):
                     shutil.rmtree(entry_path)
-                else:
-                    os.unlink(entry_path)
 
     def _validate_cpu_backup_backend(
         self,
@@ -460,21 +414,15 @@ _THREAD_STATE = threading.local()
 
 class _TorchMemorySaverImpl:
     _instances: weakref.WeakSet["_TorchMemorySaverImpl"] = weakref.WeakSet()
+    _loaded_wrappers: dict[str, BinaryWrapper] = {}
     _region_pause_lock = threading.Lock()
+    _active_scopes: int = 0
     _thread_state = _THREAD_STATE
     _is_xpu: bool = False
     _is_musa: bool = False
 
-    def _native_singleton_key(self) -> tuple:
-        wrapper = getattr(self, "_binary_wrapper", None)
-        resolved = getattr(wrapper, "_resolved_binary_path", None)
-        if isinstance(resolved, str) and resolved:
-            return ("path", resolved)
-        cdll = getattr(wrapper, "cdll", None)
-        if cdll is not None:
-            handle = getattr(cdll, "_handle", None)
-            return ("handle", handle) if handle is not None else ("cdll", id(cdll))
-        return ("hook_mode", getattr(self, "_hook_mode", None))
+    def _native_singleton_key(self) -> str:
+        return self._binary_wrapper._resolved_binary_path
 
     def __init__(self, hook_mode: HookMode = "preload"):
         self._is_xpu = is_xpu()
@@ -504,9 +452,10 @@ class _TorchMemorySaverImpl:
             # MusaMemPool.use() temporarily replaces the process-global
             # empty_cache, so overlapping disable() scopes are unsupported.
             self._musa_disable_lock = threading.Lock()
-        self._open_write_once_counts: dict[str, int] = {}
         self._active_mem_pools: set[object] = set()
-        with self._region_pause_lock:
+        with _DISK_CONFIG_LOCK:
+            self._loaded_wrappers[self._binary_wrapper._resolved_binary_path] = self._binary_wrapper
+        with _TorchMemorySaverImpl._region_pause_lock:
             self._instances.add(self)
 
         _sanity_checks()
@@ -518,47 +467,6 @@ class _TorchMemorySaverImpl:
     def _clear_all_pools(self) -> None:
         self._mem_pools.clear()
         self._write_once_pools.clear()
-
-    @contextmanager
-    def _locked_region_state(self):
-        class_lock = _TorchMemorySaverImpl._region_pause_lock
-        inst_lock = self._region_pause_lock
-        if inst_lock is not class_lock:
-            with class_lock:
-                with inst_lock:
-                    yield
-        else:
-            with inst_lock:
-                yield
-
-    def _pool_map(self, write_once: bool) -> defaultdict[_PoolKey, object]:
-        return self._write_once_pools if write_once else self._mem_pools
-
-    def _reserve_active_region_pool(self, key: _PoolKey, write_once: bool):
-        with self._locked_region_state():
-            pools = self._pool_map(write_once)
-            mem_pool = pools[key]
-            if mem_pool in self._active_mem_pools:
-                raise RuntimeError(
-                    f"Cannot enter overlapping region() scopes sharing the same MemPool {key!r}; "
-                    "use distinct tags or TorchMemorySaver instances across concurrent threads."
-                )
-            self._active_mem_pools.add(mem_pool)
-            if write_once:
-                self._open_write_once_counts[key.tag] = (
-                    self._open_write_once_counts.get(key.tag, 0) + 1
-                )
-            return mem_pool
-
-    def _release_active_region_pool(self, mem_pool, tag: str, write_once: bool) -> None:
-        with self._locked_region_state():
-            self._active_mem_pools.discard(mem_pool)
-            if write_once:
-                remaining = self._open_write_once_counts.get(tag, 0) - 1
-                if remaining > 0:
-                    self._open_write_once_counts[tag] = remaining
-                else:
-                    self._open_write_once_counts.pop(tag, None)
 
     @contextmanager
     def region(
@@ -628,38 +536,35 @@ class _TorchMemorySaverImpl:
                 cpu_backup_backend
                 or cdll.tms_get_cpu_backup_backend().decode("utf-8")
             )
-        if backup is _BackupTarget.NONE:
-            storage = _StorageMode.NONE
-        elif backup is _BackupTarget.DISK:
-            storage = _StorageMode.DISK
-        elif resolved_cpu_backup_backend == "mmap":
-            storage = _StorageMode.CPU_MMAP
-        else:
-            storage = _StorageMode.CPU_PINNED
+        storage = (
+            _StorageMode.NONE
+            if backup is _BackupTarget.NONE
+            else _StorageMode.DISK
+            if backup is _BackupTarget.DISK
+            else _StorageMode.CPU_MMAP
+            if resolved_cpu_backup_backend == "mmap"
+            else _StorageMode.CPU_PINNED
+        )
         key = _PoolKey(tag=tag, device=device, storage=storage)
-        with self._locked_region_state():
-            existing_pool = self._pool_map(write_once).get(key)
-            if existing_pool is not None and existing_pool in self._active_mem_pools:
+        if backup is _BackupTarget.DISK:
+            with _DISK_CONFIG_LOCK:
+                disk_info = _read_disk_backup_info(cdll)
+                if not disk_info.get("direct") and not (disk_info.get("directory") or ""):
+                    raise RuntimeError(
+                        "configure disk backup first: call configure_direct_disk_backup(path), "
+                        "set_disk_backup_dir(path), or set TMS_DISK_BACKUP_DIR"
+                    )
+        with _TorchMemorySaverImpl._region_pause_lock:
+            pools = self._write_once_pools if write_once else self._mem_pools
+            mem_pool = pools[key]
+            if mem_pool in self._active_mem_pools:
                 raise RuntimeError(
                     f"Cannot enter overlapping region() scopes sharing the same MemPool {key!r}; "
                     "use distinct tags or TorchMemorySaver instances across concurrent threads."
                 )
-        mem_pool = None
-        entered_region = False
+            self._active_mem_pools.add(mem_pool)
+            _TorchMemorySaverImpl._active_scopes += 1
         try:
-            if backup is _BackupTarget.DISK:
-                with _DISK_CONFIG_LOCK:
-                    disk_info = _read_disk_backup_info(cdll)
-                    if not disk_info.get("direct") and not (disk_info.get("directory") or ""):
-                        raise RuntimeError(
-                            "configure disk backup first: call configure_direct_disk_backup(path), "
-                            "set_disk_backup_dir(path), or set TMS_DISK_BACKUP_DIR"
-                        )
-                    mem_pool = self._reserve_active_region_pool(key, write_once)
-                    entered_region = True
-            else:
-                mem_pool = self._reserve_active_region_pool(key, write_once)
-                entered_region = True
             with self._use_thread_mem_pool(device, mem_pool):
                 with self._with_region_config(
                     tag=tag,
@@ -670,112 +575,46 @@ class _TorchMemorySaverImpl:
                 ):
                     yield
         finally:
-            if entered_region:
-                self._release_active_region_pool(mem_pool, tag, write_once)
+            with _TorchMemorySaverImpl._region_pause_lock:
+                _TorchMemorySaverImpl._active_scopes -= 1
+                self._active_mem_pools.discard(mem_pool)
+                mem_pool = None
 
-    def _enter_raw_mem_pool_ctx(self, device: int, pool):
-        dev_key = (id(self._device_module), int(device))
+    def _enter_pool_ctx(self, device: int, pool):
         dev_ctx_fn = getattr(self._device_module, "device", None)
-        with _get_device_pool_lock(dev_key):
-            ctx = None
-            try:
-                if callable(dev_ctx_fn) and self._current_device() != device:
-                    with dev_ctx_fn(device):
-                        ctx = self._device_module.use_mem_pool(pool)
-                        pool = None
-                        ctx.__enter__()
-                else:
-                    ctx = self._device_module.use_mem_pool(pool)
-                    pool = None
-                    ctx.__enter__()
-                _ACTIVE_DEVICE_CAPTURES[dev_key] = (
-                    _ACTIVE_DEVICE_CAPTURES.get(dev_key, 0) + 1
-                )
+        if callable(dev_ctx_fn) and self._current_device() != device:
+            with dev_ctx_fn(device):
+                ctx = self._device_module.use_mem_pool(pool)
+                ctx.__enter__()
                 return ctx
-            except BaseException as exc:
-                ctx = None
-                pool = None
-                if exc.__traceback__ is not None:
-                    traceback.clear_frames(exc.__traceback__)
-                raise
-
-    def _exit_raw_mem_pool_ctx(
-        self,
-        device: int,
-        entry_box: list,
-        exc_info,
-        *,
-        retire_pool: bool = False,
-        drain: bool = True,
-    ) -> None:
-        dev_key = (id(self._device_module), int(device))
-        with _get_device_pool_lock(dev_key):
-            ctx = entry_box[2]
-            entry_box[2] = None
-            if retire_pool and entry_box[1] is not None:
-                _RETIRED_DEVICE_MEM_POOLS.setdefault(dev_key, []).append(
-                    entry_box[1]
-                )
-                entry_box[1] = None
-            exited_cleanly = False
-            try:
-                if ctx is not None:
-                    ctx.__exit__(*exc_info)
-                exited_cleanly = True
-            finally:
-                ctx = None
-                exc_info = None
-                if exited_cleanly:
-                    _decrement_and_drain_device_captures(dev_key, drain=drain)
-
-    def _retire_device_mem_pool_box(self, device: int, pool_box: list) -> None:
-        dev_key = (id(self._device_module), int(device))
-        with _get_device_pool_lock(dev_key):
-            if _ACTIVE_DEVICE_CAPTURES.get(dev_key, 0) > 0:
-                if pool_box[0] is not None:
-                    _RETIRED_DEVICE_MEM_POOLS.setdefault(dev_key, []).append(
-                        pool_box[0]
-                    )
-                    pool_box[0] = None
-            else:
-                pool_box[0] = None
+        ctx = self._device_module.use_mem_pool(pool)
+        ctx.__enter__()
+        return ctx
 
     @contextmanager
-    def _use_thread_mem_pool(
-        self, device: int, pool, *, retire_on_exit: bool = False
-    ):
+    def _use_thread_mem_pool(self, device: int, pool, *, dispose_on_exit: bool = False):
         # PyTorch routes allocations to the first matching captures_underway_ entry on the thread,
         # so suspend any outer TMS scope on this (thread, device) while keeping its MemPool alive.
         stacks = getattr(_THREAD_STATE, "active_pool_stacks", None)
         if stacks is None:
-            stacks = {}
-            _THREAD_STATE.active_pool_stacks = stacks
+            stacks = _THREAD_STATE.active_pool_stacks = {}
         stack = stacks.setdefault(device, [])
-        outer_entry = stack[-1] if stack else None
-        did_suspend_outer = outer_entry is not None and outer_entry[2] is not None
-        if did_suspend_outer:
-            outer_entry[0]._exit_raw_mem_pool_ctx(
-                device, outer_entry, (None, None, None), retire_pool=False, drain=False
-            )
-        entry = [self, pool, None]
+        outer = stack[-1] if stack else None
+        if outer is not None and outer[1] is not None:
+            outer[1].__exit__(None, None, None)
+            outer[1] = None
+        entry = [pool, None]
         pool = None
         try:
-            entry[2] = self._enter_raw_mem_pool_ctx(device, entry[1])
+            entry[1] = self._enter_pool_ctx(device, entry[0])
         except BaseException:
-            if retire_on_exit:
-                fail_box = [entry[1]]
-                entry[1] = None
-                self._retire_device_mem_pool_box(device, fail_box)
-                fail_box = None
-            else:
-                entry[1] = None
-            if did_suspend_outer and outer_entry[2] is None:
-                outer_entry[2] = outer_entry[0]._enter_raw_mem_pool_ctx(
-                    device, outer_entry[1]
-                )
+            entry.clear()
+            if outer is not None and outer[1] is None:
+                outer[1] = outer[2]._enter_pool_ctx(device, outer[0])
             if not stack:
                 stacks.pop(device, None)
             raise
+        entry.append(self)
         stack.append(entry)
         try:
             yield
@@ -783,20 +622,13 @@ class _TorchMemorySaverImpl:
             popped = stack.pop()
             if not stack:
                 stacks.pop(device, None)
-            exc_info = sys.exc_info()
             try:
-                self._exit_raw_mem_pool_ctx(
-                    device,
-                    popped,
-                    exc_info,
-                    retire_pool=retire_on_exit,
-                )
+                popped[1].__exit__(*sys.exc_info())
+                if dispose_on_exit:
+                    popped.clear()
             finally:
-                exc_info = None
-                if did_suspend_outer and outer_entry[2] is None:
-                    outer_entry[2] = outer_entry[0]._enter_raw_mem_pool_ctx(
-                        device, outer_entry[1]
-                    )
+                if outer is not None and outer[1] is None:
+                    outer[1] = outer[2]._enter_pool_ctx(device, outer[0])
 
     def _current_device(self) -> int:
         return self._device_module.current_device()
@@ -822,47 +654,21 @@ class _TorchMemorySaverImpl:
         assert self._hook_mode == "preload", "Only hook_mode=preload supports pauseable CUDA Graph currently"
         if is_mlu():
             _sanity_checks()
-        graph_ctx = self._device_module.graph(
-            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
-        )
-        capture_stream = getattr(graph_ctx, "capture_stream", stream)
-        graph_dev = getattr(capture_stream, "device_index", None)
-        if graph_dev is None:
-            graph_dev = getattr(getattr(capture_stream, "device", None), "index", None)
-        if graph_dev is None:
-            graph_dev = self._current_device()
-        dev_key = (id(self._device_module), int(graph_dev))
-        with _get_device_pool_lock(dev_key):
-            _ACTIVE_DEVICE_CAPTURES[dev_key] = _ACTIVE_DEVICE_CAPTURES.get(dev_key, 0) + 1
-            try:
-                graph_ctx.__enter__()
-            except BaseException:
-                _decrement_and_drain_device_captures(dev_key)
-                raise
-        suppress = False
-        exc_info = (None, None, None)
+        with _TorchMemorySaverImpl._region_pause_lock:
+            _TorchMemorySaverImpl._active_scopes += 1
         try:
-            with self._with_region_config(
-                tag=tag,
-                enable_cpu_backup=enable_cpu_backup,
-                cpu_backup_backend=cpu_backup_backend,
+            with self._device_module.graph(
+                cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
             ):
-                yield
-        except BaseException:
-            exc_info = sys.exc_info()
-            raise
+                with self._with_region_config(
+                    tag=tag,
+                    enable_cpu_backup=enable_cpu_backup,
+                    cpu_backup_backend=cpu_backup_backend,
+                ):
+                    yield
         finally:
-            with _get_device_pool_lock(dev_key):
-                exited_cleanly = False
-                try:
-                    suppress = bool(graph_ctx.__exit__(*exc_info))
-                    exited_cleanly = True
-                finally:
-                    exc_info = (None, None, None)
-                    if exited_cleanly:
-                        _decrement_and_drain_device_captures(dev_key)
-            if suppress:
-                return
+            with _TorchMemorySaverImpl._region_pause_lock:
+                _TorchMemorySaverImpl._active_scopes -= 1
 
     @contextmanager
     def _with_region_config(
@@ -940,32 +746,38 @@ class _TorchMemorySaverImpl:
                 "Allocate outside a region() instead of using disable()."
             )
         prev_disable = getattr(_THREAD_STATE, "active_disable_depth", 0)
-        if self._is_musa:
-            with self._musa_disable(dispose_mem_pool_after_use):
-                _THREAD_STATE.active_disable_depth = prev_disable + 1
-                try:
-                    yield
-                finally:
-                    _THREAD_STATE.active_disable_depth = prev_disable
-            return
-
-        assert dispose_mem_pool_after_use, "Only dispose_mem_pool_after_use=true is supported now"
-        assert self._binary_wrapper.cdll.tms_get_interesting_region(), "disable() should be called only when tms is active"
-
-        self._binary_wrapper.cdll.tms_set_interesting_region(False)
-        _THREAD_STATE.active_disable_depth = prev_disable + 1
+        with _TorchMemorySaverImpl._region_pause_lock:
+            _TorchMemorySaverImpl._active_scopes += 1
         try:
-            # We can either reuse the pool or delete it immediately, and we implement the latter currently since Slime uses it.
-            # About why we need a pool: https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
-            with self._use_thread_mem_pool(
-                self._current_device(),
-                self._device_module.MemPool(),
-                retire_on_exit=True,
-            ):
-                yield
+            if self._is_musa:
+                with self._musa_disable(dispose_mem_pool_after_use):
+                    _THREAD_STATE.active_disable_depth = prev_disable + 1
+                    try:
+                        yield
+                    finally:
+                        _THREAD_STATE.active_disable_depth = prev_disable
+                return
+
+            assert dispose_mem_pool_after_use, "Only dispose_mem_pool_after_use=true is supported now"
+            assert self._binary_wrapper.cdll.tms_get_interesting_region(), "disable() should be called only when tms is active"
+
+            self._binary_wrapper.cdll.tms_set_interesting_region(False)
+            _THREAD_STATE.active_disable_depth = prev_disable + 1
+            try:
+                # We can either reuse the pool or delete it immediately, and we implement the latter currently since Slime uses it.
+                # About why we need a pool: https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
+                with self._use_thread_mem_pool(
+                    self._current_device(),
+                    self._device_module.MemPool(),
+                    dispose_on_exit=True,
+                ):
+                    yield
+            finally:
+                _THREAD_STATE.active_disable_depth = prev_disable
+                self._binary_wrapper.cdll.tms_set_interesting_region(True)
         finally:
-            _THREAD_STATE.active_disable_depth = prev_disable
-            self._binary_wrapper.cdll.tms_set_interesting_region(True)
+            with _TorchMemorySaverImpl._region_pause_lock:
+                _TorchMemorySaverImpl._active_scopes -= 1
 
     @contextmanager
     def _musa_disable(self, dispose_mem_pool_after_use: bool = True):
@@ -1004,16 +816,19 @@ class _TorchMemorySaverImpl:
     def pause(self, tag: Optional[str]):
         _validate_tag(tag, allow_none=True)
         my_key = self._native_singleton_key()
-        with self._region_pause_lock:
-            for inst in list(self._instances):
-                if inst._native_singleton_key() != my_key:
-                    continue
-                if any(not tag or open_tag == tag for open_tag in inst._open_write_once_counts):
-                    raise RuntimeError(
-                        "Cannot pause() while inside an open write_once region"
-                        + (f" (tag={tag!r})" if tag else "")
-                        + "; exit the region before calling pause()."
-                    )
+        with _TorchMemorySaverImpl._region_pause_lock:
+            matching_keys = [
+                (inst, key)
+                for inst in self._instances
+                if inst._native_singleton_key() == my_key
+                for key in inst._write_once_pools.keys()
+                if not tag or key.tag == tag
+            ]
+            if matching_keys and _TorchMemorySaverImpl._active_scopes > 0:
+                raise RuntimeError(
+                    "Cannot pause() a write_once region while another region(), disable(), "
+                    "or cuda_graph() scope is active; exit active scopes first."
+                )
             self._sync_affected_devices(tag)
             tag_bytes = tag.encode("utf-8") if tag else None
             ret = self._binary_wrapper.cdll.tms_pause(tag_bytes)
@@ -1023,19 +838,8 @@ class _TorchMemorySaverImpl:
                     f"(code {ret}); some allocations could not be released and are "
                     "retained. Retry after resolving the failure."
                 )
-            retired_boxes = []
-            for inst in list(self._instances):
-                if inst._native_singleton_key() != my_key:
-                    continue
-                for key in list(inst._write_once_pools.keys()):
-                    if not tag or key.tag == tag:
-                        # Retire the write_once MemPool; destroy immediately only when no capture/pool
-                        # is active on key.device, otherwise defer until active captures hit 0.
-                        retired_boxes.append((inst, key.device, [inst._write_once_pools.pop(key)]))
-        while retired_boxes:
-            ret_inst, ret_dev, pool_box = retired_boxes.pop()
-            ret_inst._retire_device_mem_pool_box(ret_dev, pool_box)
-            pool_box = None
+            for inst, key in matching_keys:
+                inst._write_once_pools.pop(key, None)
 
     def resume(self, tag: Optional[str]):
         _validate_tag(tag, allow_none=True)

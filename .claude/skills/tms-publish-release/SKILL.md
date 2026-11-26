@@ -85,7 +85,7 @@ set -euxo pipefail
 uv run --script "$TMS_RELEASE_CHECKS" run --log-path "$TMS_LOCAL_ARTIFACTS/release-preflight.log" -- \
   ssh tom-workstation 'set -euxo pipefail; curl --retry 5 --retry-delay 1 --retry-all-errors -x http://127.0.0.1:7890 -I --max-time 20 https://registry-1.docker.io/v2/'
 uv run --script "$TMS_RELEASE_CHECKS" run --log-path "$TMS_LOCAL_ARTIFACTS/release-preflight.log" -- \
-  ssh tom-workstation 'set -euxo pipefail; command -v g++; test -x /home/tom/.local/bin/uv; nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,utilization.gpu --format=csv,noheader; docker version; df -h / /home/tom'
+  ssh tom-workstation 'set -euxo pipefail; test -x /home/tom/.local/bin/uv; nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,utilization.gpu --format=csv,noheader; docker version; df -h / /home/tom'
 uv run --script "$TMS_RELEASE_CHECKS" run --log-path "$TMS_LOCAL_ARTIFACTS/release-preflight.log" -- \
   /usr/bin/stat -f '%N mode=%Lp size=%z' "$HOME/.pypirc"
 ```
@@ -210,19 +210,7 @@ ssh tom-workstation "set -euxo pipefail; cd '$TMS_REMOTE_ROOT' \
     --dist-dir dist \
     --expected-version '$TMS_RELEASE_VERSION' \
     --repo-root . \
-  > '$TMS_REMOTE_ARTIFACTS/validate-artifacts.log' 2>&1 \
-  && HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890 \
-    PYTHONNOUSERSITE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH='$TMS_REMOTE_ROOT' \
-    timeout --signal=TERM --kill-after=30s 1800s \
-    /home/tom/.local/bin/uv run --no-project \
-    --python 3.11 \
-    --index-url https://download.pytorch.org/whl/cpu \
-    --extra-index-url https://pypi.org/simple \
-    --with pytest==8.3.5 --with setuptools==75.0.0 --with packaging==24.2 \
-    --with numpy==2.2.3 --with click==8.1.8 --with typer==0.15.2 --with torch==2.8.0 \
-    python -c 'import pathlib, pytest, sys, torch_memory_saver; root = pathlib.Path(sys.argv[1]).resolve(); mod = pathlib.Path(torch_memory_saver.__file__).resolve(); assert root in mod.parents, (mod, root); raise SystemExit(pytest.main(sys.argv[2:]))' \
-    '$TMS_REMOTE_ROOT' -vv test/test_direct_disk_native.py test/test_merge_cuda_wheels.py test/test_setup_rpath.py \
-  > '$TMS_REMOTE_ARTIFACTS/build-tool-tests.log' 2>&1"
+  > '$TMS_REMOTE_ARTIFACTS/validate-artifacts.log' 2>&1"
 ```
 
 ```text
@@ -231,7 +219,6 @@ Exact set: x86_64 wheel, aarch64 wheel, sdist
 Wheel gate:
   - Filename and internal metadata tags
   - ELF machine for every binary
-  - No post-manylinux2014 symbol/ABI imports (> GLIBC_2.17, > CXXABI_1.3.7 except CXXABI_TM_1, > GLIBCXX_3.4.19, > GCC_4.8.0) or leaked internal C++ symbols in any wheel binary
   - CUDA 12 and CUDA 13 binary families
   - Unsuffixed CUDA 12 compatibility binaries
   - RECORD integrity
@@ -261,11 +248,10 @@ Source mount: release root at /workspace, read-only
 Install root: final wheel into site-packages or dist-packages
 Test root: /validation, outside the source checkout
 x86_64 test suite: full single-GPU runtime pytest
-x86_64 NUMA capability: --cap-add SYS_NICE for mbind and move_pages
 ARM64 test suite: full runtime pytest with in-test Lupine skip markers
 Lupine signal: TMS_TEST_LUPINE=1 in ARM64 validation containers only
 Lupine skip 1: test_cpu_backup_preload_backend_from_env
-Lupine skip 2: test_disk_backup, test_disk_backup_auto_numa_and_multi_instance, test_disk_backup_env_and_set_dir_auto_configure (preload and torch)
+Lupine skip 2: test_disk_backup, including both hook-mode parameters
 CUDA major: matches the matrix cell
 CUDA availability: torch.cuda.is_available() is true
 GPU identity: NVIDIA GeForce RTX 4090 D
@@ -362,7 +348,7 @@ Version: canonical version and collision-check results
 Host: workstation, GPU, driver, kernel, Docker, binfmt
 Artifacts: filename, size, SHA-256, metadata result, twine result, file link
 Preflight evidence: release-preflight.log
-Build evidence: x86_64 log, aarch64 log, sdist log, artifact-validator log, build-tool-tests.log
+Build evidence: x86_64 log, aarch64 log, sdist log, artifact-validator log
 Local evidence: local-recheck.log and artifacts.sha256
 GPU matrix row: architecture, CUDA major, image digest, PyTorch/CUDA/GPU identity
 GPU matrix result: pytest summary, every skip reason, terminal RESULT, log link

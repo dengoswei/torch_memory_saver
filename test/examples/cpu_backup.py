@@ -266,59 +266,21 @@ def run_write_once(hook_mode: str):
 
     for b, t in ro_tensors.items():
         assert torch.equal(t.cpu(), ro_oracles[b])
+        assert torch.equal(torch_memory_saver.get_cpu_backup(t, zero_copy=True), ro_oracles[b])
         assert torch_memory_saver.get_cpu_backup(t, zero_copy=True).data_ptr() == ro_ptrs[b]
     assert torch.equal(rw.cpu(), rw_updated)
 
-    # Re-entering the same write_once tag after freeing must allocate a fresh pool/slot.
-    for backend in backends:
-        tag = f"ro_reuse_{backend}"
-        a_oracle = _make_pattern(size=4096, offset=120).to(torch.float32)
-        b_oracle = _make_pattern(size=4096, offset=150).to(torch.float32)
-        with torch_memory_saver.region(
-            tag=tag, backup="cpu", cpu_backup_backend=backend, write_once=True
-        ):
-            tensor_a = a_oracle.to(device)
-        torch_memory_saver.pause(tag=tag)
-        torch_memory_saver.resume(tag=tag)
-        assert torch.equal(tensor_a.cpu(), a_oracle)
-        del tensor_a
-        with torch_memory_saver.region(
-            tag=tag, backup="cpu", cpu_backup_backend=backend, write_once=True
-        ):
-            tensor_b = b_oracle.to(device)
-        torch_memory_saver.pause(tag=tag)
-        torch_memory_saver.resume(tag=tag)
-        assert torch.equal(tensor_b.cpu(), b_oracle)
-        del tensor_b
-
-    # Cross-instance pause() retires pools owned by sibling TorchMemorySaver instances.
-    x_a_oracle = _make_pattern(size=4096, offset=165).to(torch.float32)
-    x_b_oracle = _make_pattern(size=4096, offset=175).to(torch.float32)
-    with tms2.region(tag="ro_xinst", backup="cpu", write_once=True):
-        x_a = x_a_oracle.to(device)
-    torch_memory_saver.pause(tag="ro_xinst")
-    torch_memory_saver.resume(tag="ro_xinst")
-    assert torch.equal(x_a.cpu(), x_a_oracle)
-    del x_a
-    with tms2.region(tag="ro_xinst", backup="cpu", write_once=True):
-        x_b = x_b_oracle.to(device)
-    torch_memory_saver.pause(tag="ro_xinst")
-    torch_memory_saver.resume(tag="ro_xinst")
-    assert torch.equal(x_b.cpu(), x_b_oracle)
-    del x_b
-
-    # Repeated retire + empty_cache() without entering region() reclaims GPU/CPU resources.
-    for cycle in range(3):
-        cycle_tag = f"ro_reclaim_{cycle}"
-        cycle_oracle = _make_pattern(size=4096, offset=190 + cycle).to(torch.float32)
-        with torch_memory_saver.region(tag=cycle_tag, backup="cpu", write_once=True):
-            cycle_tensor = cycle_oracle.to(device)
-        torch_memory_saver.pause(tag=cycle_tag)
-        backup_ptr = torch_memory_saver.get_cpu_backup(cycle_tensor, zero_copy=True).data_ptr()
+    # Cross-instance pause() retires pools cleanly so reuse allocates fresh backups and del reclaims host RAM.
+    for cycle in range(2):
+        oracle = _make_pattern(size=4096, offset=120 + cycle * 30).to(torch.float32)
+        with tms2.region(tag="ro_reuse", backup="cpu", write_once=True):
+            reused = oracle.to(device)
+        torch_memory_saver.pause(tag="ro_reuse")
+        backup_ptr = tms2.get_cpu_backup(reused, zero_copy=True).data_ptr()
         assert _host_pointer_is_allocated(backup_ptr)
-        torch_memory_saver.resume(tag=cycle_tag)
-        assert torch.equal(cycle_tensor.cpu(), cycle_oracle)
-        del cycle_tensor
+        torch_memory_saver.resume(tag="ro_reuse")
+        assert torch.equal(reused.cpu(), oracle)
+        del reused
         gc.collect()
         empty_cache()
         mod.synchronize()

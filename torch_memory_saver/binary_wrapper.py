@@ -2,7 +2,6 @@ import ctypes
 import logging
 import os
 import re
-import sys
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -36,26 +35,7 @@ class BinaryWrapper:
         enable_disk_backup: bool = False,
         write_once: bool = False,
     ):
-        if not isinstance(tag, str) or "\x00" in tag:
-            raise ValueError("tag must be a valid UTF-8 string without NUL")
-        try:
-            encoded_tag = tag.encode("utf-8", errors="strict")
-        except UnicodeEncodeError as exc:
-            raise ValueError("tag must be a valid UTF-8 string without NUL") from exc
-        if cpu_backup_backend is not None and (
-            not isinstance(cpu_backup_backend, str)
-            or cpu_backup_backend not in ("pinned", "mmap")
-        ):
-            raise ValueError(
-                f"cpu_backup_backend must be 'pinned', 'mmap', or None, got {cpu_backup_backend!r}"
-            )
-        if write_once:
-            hip_ver = getattr(getattr(sys.modules.get("torch"), "version", None), "hip", None)
-            if _is_rocm_legacy_chunked(hip_ver) or not self.cdll.tms_supports_write_once():
-                raise NotImplementedError(
-                    "TorchMemorySaver write_once is not supported on this backend."
-                )
-        self.cdll.tms_set_current_tag(encoded_tag)
+        self.cdll.tms_set_current_tag(tag.encode("utf-8", errors="strict"))
         self.cdll.tms_set_interesting_region(interesting_region)
         self.cdll.tms_set_enable_cpu_backup(enable_cpu_backup)
         if cpu_backup_backend is not None:

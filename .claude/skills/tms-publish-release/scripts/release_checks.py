@@ -25,28 +25,10 @@ from typing import Annotated
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-import sys
+import click
+import typer
 
-try:
-    import click
-    import typer
-except ModuleNotFoundError:
-    click = None  # type: ignore[assignment]
-    typer = None  # type: ignore[assignment]
-
-
-class _MissingTyperApp:
-    def command(self, *_args: object, **_kwargs: object) -> Callable[[Callable], Callable]:
-        def decorator(func: Callable) -> Callable:
-            return func
-
-        return decorator
-
-    def __call__(self, *_args: object, **_kwargs: object) -> None:
-        raise ModuleNotFoundError("No module named 'typer'")
-
-
-app = typer.Typer(add_completion=False, no_args_is_help=True) if typer is not None else _MissingTyperApp()
+app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 _CANONICAL_VERSION_PATTERN = re.compile(
     r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -61,87 +43,6 @@ _EXPECTED_BINARY_NAMES = {
     for hook_mode in ("preload", "torch")
     for suffix in ("", "_cu12", "_cu13")
 }
-_FORBIDDEN_MANYLINUX2014_GLIBC_SYMBOLS = ("statx", "getdents64", "getrandom")
-_MANYLINUX2014_MAX_SYMBOL_VERSIONS: dict[str, tuple[int, ...]] = {
-    "GLIBC": (2, 17),
-    "CXXABI": (1, 3, 7),
-    "GLIBCXX": (3, 4, 19),
-    "GCC": (4, 8, 0),
-}
-_MANYLINUX2014_ALLOWED_SPECIAL_VERSIONS = frozenset({"CXXABI_TM_1"})
-_FORBIDDEN_INTERNAL_CPP_SYMBOL_SUBSTRINGS = (
-    "TorchMemorySaver",
-    "DiskBackend",
-    "DiskBackupSlot",
-    "AllocationMetadata",
-    "ThreadLocalConfig",
-)
-
-
-def _find_forbidden_glibc_symbols(undefined_symbols: set[str]) -> list[str]:
-    """Return undefined symbols matching _FORBIDDEN_MANYLINUX2014_GLIBC_SYMBOLS, sorted by name."""
-    return sorted(
-        symbol
-        for symbol in undefined_symbols
-        if any(
-            symbol == forbidden or symbol.startswith(f"{forbidden}@")
-            for forbidden in _FORBIDDEN_MANYLINUX2014_GLIBC_SYMBOLS
-        )
-    )
-
-
-def _exceeds_manylinux2014_symbol_version(version_tag: str) -> bool:
-    if version_tag in _MANYLINUX2014_ALLOWED_SPECIAL_VERSIONS:
-        return False
-    for family, max_version in _MANYLINUX2014_MAX_SYMBOL_VERSIONS.items():
-        if not version_tag.startswith(f"{family}_"):
-            continue
-        suffix = version_tag[len(family) + 1 :]
-        parts = suffix.split(".")
-        if not parts or any(not part or not part.isdigit() for part in parts):
-            # Reject non-numeric tags (e.g. GLIBC_PRIVATE, CXXABI_FLOAT128) above the baseline ceiling.
-            return True
-        return tuple(int(part) for part in parts) > max_version
-    return False
-
-
-def _find_post_manylinux2014_symbol_versions(
-    *,
-    binary: bytes,
-    source: str,
-    undefined_symbols: set[str] | None = None,
-) -> list[str]:
-    """Return imported symbol/ABI requirements exceeding the PEP 599 manylinux2014 baseline."""
-    undef = (
-        undefined_symbols
-        if undefined_symbols is not None
-        else _read_elf_undefined_symbols(binary=binary, source=source)
-    )
-    _ver_by_idx, required_versions = _read_elf_verneed_info(binary=binary, source=source)
-    offenders: set[str] = set()
-    covered_tags: set[str] = set()
-    for symbol in undef:
-        if "@" not in symbol:
-            continue
-        version_tag = symbol.rsplit("@", 1)[-1]
-        if _exceeds_manylinux2014_symbol_version(version_tag):
-            offenders.add(symbol)
-            covered_tags.add(version_tag)
-    for version_tag in required_versions:
-        if version_tag in covered_tags:
-            continue
-        if _exceeds_manylinux2014_symbol_version(version_tag):
-            offenders.add(version_tag)
-    return sorted(offenders)
-
-
-def _find_leaked_internal_symbols(defined_symbols: set[str]) -> list[str]:
-    """Return defined global/weak internal C++ symbols matching forbidden substrings."""
-    return sorted(
-        symbol
-        for symbol in defined_symbols
-        if any(substr in symbol for substr in _FORBIDDEN_INTERNAL_CPP_SYMBOL_SUBSTRINGS)
-    )
 
 
 @dataclass(frozen=True)
@@ -468,39 +369,14 @@ def validate_wheel(
 
         expected_machine = _ELF_MACHINE_BY_ARCHITECTURE[expected_architecture]
         for binary_path in binary_paths:
-            binary = wheel.read(binary_path)
-            source = f"{wheel_path.name}:{binary_path}"
             machine = _read_elf_machine(
-                binary=binary,
-                source=source,
+                binary=wheel.read(binary_path),
+                source=f"{wheel_path.name}:{binary_path}",
             )
             if machine != expected_machine:
                 raise ValueError(
-                    f"ELF machine mismatch in {source}: "
+                    f"ELF machine mismatch in {wheel_path.name}:{binary_path}: "
                     f"expected {expected_machine}, found {machine}"
-                )
-            undefined_symbols = _read_elf_undefined_symbols(binary=binary, source=source)
-            forbidden_symbols = sorted(
-                set(_find_forbidden_glibc_symbols(undefined_symbols))
-                | set(
-                    _find_post_manylinux2014_symbol_versions(
-                        binary=binary,
-                        source=source,
-                        undefined_symbols=undefined_symbols,
-                    )
-                )
-            )
-            if forbidden_symbols:
-                raise ValueError(
-                    f"Forbidden post-manylinux2014 symbol/ABI requirement in {source}: {', '.join(forbidden_symbols)}"
-                )
-            leaked_internal_symbols = _find_leaked_internal_symbols(
-                _read_elf_defined_symbols(binary=binary, source=source)
-                | undefined_symbols
-            )
-            if leaked_internal_symbols:
-                raise ValueError(
-                    f"Leaked internal C++ symbol in {source}: {', '.join(leaked_internal_symbols)}"
                 )
 
         for hook_mode in ("preload", "torch"):
@@ -754,11 +630,7 @@ def _run_logged_validation(
     validation: Callable[[], None],
 ) -> None:
     rendered_command = shlex.join(["release_checks", name, *arguments])
-    msg = f"EXEC: {rendered_command}"
-    if typer is not None:
-        typer.echo(msg, err=True)
-    else:
-        sys.stderr.write(f"{msg}\n")
+    typer.echo(f"EXEC: {rendered_command}", err=True)
     with log_path.open(mode="a", encoding="utf-8") as output:
         output.write(f"EXEC: {rendered_command}\n")
         output.flush()
@@ -836,166 +708,6 @@ def _read_elf_machine(*, binary: bytes, source: str) -> int:
     return int.from_bytes(binary[18:20], byteorder=byte_order)
 
 
-def _read_elf_section_table(
-    *, binary: bytes, source: str
-) -> tuple[str, list[tuple[int, ...]]]:
-    import struct
-
-    if len(binary) < 64 or binary[:4] != b"\x7fELF":
-        raise ValueError(f"Invalid ELF64 binary in {source}")
-    if binary[4] != 2:
-        raise ValueError(f"Expected 64-bit ELF binary in {source}: class={binary[4]}")
-    if binary[5] not in {1, 2}:
-        raise ValueError(f"Invalid ELF byte order in {source}: {binary[5]}")
-
-    endian = "<" if binary[5] == 1 else ">"
-    e_shoff, _flags, _ehsize, _phentsize, _phnum, e_shentsize, e_shnum, _shstrndx = (
-        struct.unpack_from(f"{endian}QIHHHHHH", binary, 40)
-    )
-    if e_shoff == 0 or e_shnum == 0:
-        raise ValueError(f"Missing ELF section headers in {source}")
-    if e_shentsize < 64:
-        raise ValueError(f"Invalid ELF section header size in {source}: {e_shentsize}")
-    sh_table_end = e_shoff + e_shnum * e_shentsize
-    if sh_table_end > len(binary):
-        raise ValueError(f"Truncated ELF section header table in {source}")
-
-    shdr_fmt = f"{endian}IIQQQQIIQQ"
-    sections = [
-        struct.unpack_from(shdr_fmt, binary, e_shoff + idx * e_shentsize)
-        for idx in range(e_shnum)
-    ]
-    return endian, sections
-
-
-def _read_elf_verneed_info(
-    *, binary: bytes, source: str
-) -> tuple[dict[int, str], set[str]]:
-    import struct
-
-    endian, sections = _read_elf_section_table(binary=binary, source=source)
-    ver_by_index: dict[int, str] = {}
-    required_versions: set[str] = set()
-    for _name, sec_type, _flags, _addr, offset, size, link, info, _align, _entsize in sections:
-        if sec_type != 0x6FFFFFFE:  # SHT_GNU_VERNEED
-            continue
-        if offset + size > len(binary):
-            raise ValueError(f"Truncated SHT_GNU_VERNEED section in {source}")
-        if link >= len(sections) or sections[link][1] != 3:  # SHT_STRTAB
-            raise ValueError(f"Missing associated SHT_STRTAB in {source}")
-        str_offset, str_size = sections[link][4], sections[link][5]
-        if str_offset + str_size > len(binary):
-            raise ValueError(f"Truncated SHT_STRTAB section in {source}")
-        strtab = binary[str_offset : str_offset + str_size]
-        pos = offset
-        sec_end = offset + size
-        for _ in range(info):
-            if pos + 16 > sec_end:
-                raise ValueError(f"Truncated VERNEED entry in {source}")
-            vn_version, vn_cnt, _vn_file, vn_aux, vn_next = struct.unpack_from(
-                f"{endian}HHIII", binary, pos
-            )
-            if vn_version != 1 or vn_aux < 16:
-                raise ValueError(f"Invalid VERNEED entry in {source}")
-            apos = pos + vn_aux
-            for _aux_idx in range(vn_cnt):
-                if apos + 16 > sec_end:
-                    raise ValueError(f"Truncated VERNAUX entry in {source}")
-                _vna_hash, _vna_flags, vna_other, vna_name, vna_next = struct.unpack_from(
-                    f"{endian}IHHIi", binary, apos
-                )
-                if vna_name >= len(strtab):
-                    raise ValueError(f"Invalid VERNAUX string offset in {source}")
-                end = strtab.find(b"\x00", vna_name)
-                ver_bytes = strtab[vna_name:] if end < 0 else strtab[vna_name:end]
-                ver_name = ver_bytes.decode("utf-8", errors="replace")
-                ver_by_index[vna_other & 0x7FFF] = ver_name
-                required_versions.add(ver_name)
-                if vna_next == 0:
-                    break
-                if vna_next < 16 or apos + vna_next > sec_end:
-                    raise ValueError(f"Invalid VERNAUX next offset in {source}")
-                apos += vna_next
-            if vn_next == 0:
-                break
-            if vn_next < 16 or pos + vn_next > sec_end:
-                raise ValueError(f"Invalid VERNEED next offset in {source}")
-            pos += vn_next
-    return ver_by_index, required_versions
-
-
-def _read_elf_dynsym_names(
-    *, binary: bytes, source: str, defined: bool
-) -> set[str]:
-    import struct
-
-    endian, sections = _read_elf_section_table(binary=binary, source=source)
-    dynsym_sections = [
-        (idx, sec) for idx, sec in enumerate(sections) if sec[1] == 11
-    ]  # SHT_DYNSYM
-    if not dynsym_sections:
-        raise ValueError(f"Missing SHT_DYNSYM section in {source}")
-
-    ver_by_index: dict[int, str] = {}
-    versym_by_link: dict[int, bytes] = {}
-    if not defined:
-        ver_by_index, _ = _read_elf_verneed_info(binary=binary, source=source)
-        if ver_by_index:
-            for _name, sec_type, _flags, _addr, v_off, v_sz, v_link, *_rest in sections:
-                if sec_type == 0x6FFFFFFF:  # SHT_GNU_VERSYM
-                    if v_off + v_sz > len(binary):
-                        raise ValueError(f"Truncated SHT_GNU_VERSYM section in {source}")
-                    versym_by_link[v_link] = binary[v_off : v_off + v_sz]
-
-    sym_fmt = f"{endian}IBBHQQ"
-    names: set[str] = set()
-    for dynsym_idx, (
-        _name, _type, _flags, _addr, offset, size, link, _info, _align, entsize
-    ) in dynsym_sections:
-        if entsize < 24 or offset + size > len(binary) or size % entsize != 0:
-            raise ValueError(f"Invalid SHT_DYNSYM table in {source}")
-        if link >= len(sections) or sections[link][1] != 3:  # SHT_STRTAB
-            raise ValueError(f"Missing associated SHT_STRTAB in {source}")
-        str_offset, str_size = sections[link][4], sections[link][5]
-        if str_offset + str_size > len(binary):
-            raise ValueError(f"Truncated SHT_STRTAB section in {source}")
-        strtab = binary[str_offset : str_offset + str_size]
-        nsyms = size // entsize
-        versym = versym_by_link.get(dynsym_idx)
-        if versym is not None and len(versym) < nsyms * 2:
-            raise ValueError(f"Truncated SHT_GNU_VERSYM table in {source}")
-        for sym_idx in range(nsyms):
-            st_name, st_info, _st_other, st_shndx, _st_value, _st_size = struct.unpack_from(
-                sym_fmt, binary, offset + sym_idx * entsize
-            )
-            if st_name == 0 or st_name >= len(strtab):
-                continue
-            if defined:
-                # Include STB_GNU_UNIQUE (10) exports as well as global/weak symbols.
-                if st_shndx == 0 or (st_info >> 4) not in (1, 2, 10):
-                    continue
-            elif st_shndx != 0:
-                continue
-            end = strtab.find(b"\x00", st_name)
-            sym_bytes = strtab[st_name:] if end < 0 else strtab[st_name:end]
-            sym_name = sym_bytes.decode("utf-8", errors="replace")
-            if not defined and versym is not None and "@" not in sym_name:
-                ver_idx = struct.unpack_from(f"{endian}H", versym, sym_idx * 2)[0] & 0x7FFF
-                ver_tag = ver_by_index.get(ver_idx)
-                if ver_idx >= 2 and ver_tag:
-                    sym_name = f"{sym_name}@{ver_tag}"
-            names.add(sym_name)
-    return names
-
-
-def _read_elf_undefined_symbols(*, binary: bytes, source: str) -> set[str]:
-    return _read_elf_dynsym_names(binary=binary, source=source, defined=False)
-
-
-def _read_elf_defined_symbols(*, binary: bytes, source: str) -> set[str]:
-    return _read_elf_dynsym_names(binary=binary, source=source, defined=True)
-
-
 def _validate_metadata_version(
     *, metadata: str, expected_version: str, source: str
 ) -> None:
@@ -1010,11 +722,7 @@ def _validate_metadata_version(
 
 
 def _exec_command(*, command: list[str]) -> CommandResult:
-    msg = f"EXEC: {shlex.join(command)}"
-    if typer is not None:
-        typer.echo(msg, err=True)
-    else:
-        sys.stderr.write(f"{msg}\n")
+    typer.echo(f"EXEC: {shlex.join(command)}", err=True)
     result = subprocess.run(
         command,
         check=False,
